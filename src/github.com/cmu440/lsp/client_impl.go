@@ -2,10 +2,23 @@
 
 package lsp
 
-import "errors"
+import (
+	"errors"
+	"net"
+)
 
 type client struct {
 	// TODO: implement this!
+	conn net.Conn
+	connId int
+	msgReceivedChan chan Message //收到消息后，不会直接处理，而是写入chan，在goroutine中处理
+	msgReceivedNotAck map[int]Message //only save msg that type = MsgData，maxlen = windowSize
+	msgWritten map[int]Message //保存已经发送，但未收到ack的msg，所以msg类型只能是MsgConnect或者MsgData，收到ack后从map中删除
+	msgToWriteChan chan Message //当调用Write时，不会真的将msg发送，而是写入chan，在goroutine中真正发送
+	epochLimit int
+	epochMillis int
+	windowSize int
+
 }
 
 // NewClient creates, initiates, and returns a new client. This function
