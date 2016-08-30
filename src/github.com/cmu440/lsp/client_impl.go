@@ -5,20 +5,41 @@ package lsp
 import (
 	"errors"
 	"net"
+	"encoding/json"
+	"fmt"
+	"time"
+	"container/list"
+	"github.com/cmu440/lspnet"
 )
 
-type client struct {
-	// TODO: implement this!
-	conn net.Conn
-	connId int
-	msgReceivedChan chan Message //收到消息后，不会直接处理，而是写入chan，在goroutine中处理
-	msgReceivedNotAck map[int]Message //only save msg that type = MsgData，maxlen = windowSize
-	msgWritten map[int]Message //保存已经发送，但未收到ack的msg，所以msg类型只能是MsgConnect或者MsgData，收到ack后从map中删除
-	msgToWriteChan chan Message //当调用Write时，不会真的将msg发送，而是写入chan，在goroutine中真正发送
-	epochLimit int
-	epochMillis int
-	windowSize int
+const MTU = 1500
 
+type client struct {
+	conn                net.Conn
+	connId              int             //if connId = 0, then the client is not init successfully yet. the epoch routine will use this
+	epochLimit          int             // params
+	epochMillis         int
+	windowSize          int
+	//init
+	initChan            chan bool
+	shutdownChan	    chan bool
+	//write
+	nextSeqNum          int             // next msg seq num
+	writeNotAckEarliest int
+	msgWrittenMap       map[int]Message //has written to conn, but not receive ack, the epoch will read this and resend msg
+	msgWrittenAckMap    map[int]bool    //when write a msg, will record false, when receive ack, record true
+	msgToWriteCacheChan chan []byte     //when call Write, will mot write msg directly, but write to this chan, the eventHandlerRoutine will write data to msgToWriteChan
+	msgToWriteQueue     *list.List      //if msg seqNum >= writeNotAckEarList + windowSize, then msg that from msgToWriteCacheChan will write this queue first, when receive ack, the queue will write msg to msgConnectChan
+	msgConnectChan      chan Message    //the writeChan will read this chan and write to chan
+	//read
+	msgReceivedQueue     *list.List     //only save msg that type = MsgData
+	msgToProcessChan     chan Message   //receive msg, not process
+	msgReceivedChan      chan Message   //processed msg, call Read to read msg from this chan
+	//close
+	closeChan            chan bool      //use poison pills to close client
+	//epoch
+	epochCount           int
+	epochSignalChan      chan bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -32,23 +53,213 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
-	return nil, errors.New("not yet implemented")
+	cli := &client{
+		conn: nil,
+		connId: 0,
+		epochLimit: params.EpochLimit,
+		epochMillis: params.EpochMillis,
+		windowSize: params.WindowSize,
+		initChan: make(chan bool),
+		shutdownChan: make(chan bool),
+		nextSeqNum: 0,
+		writeNotAckEarliest: 0,
+		msgWrittenMap: make(map[int]Message),
+		msgWrittenAckMap: make(map[int]bool),
+		msgToWriteCacheChan: make(chan []byte),
+		msgToWriteQueue: list.New(),
+		msgConnectChan: make(chan Message),
+		msgReceivedQueue: list.New(),
+		msgToProcessChan: make(chan  Message),
+		msgReceivedChan: make(chan Message),
+		closeChan: make(chan bool),
+		epochCount: 0,
+		epochSignalChan: make(chan bool),
+	}
+
+	udpaddr, err := lspnet.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		return nil, err
+	}
+	udpconn, err := lspnet.DialUDP("udp", nil, udpaddr)
+	if err != nil {
+		return nil, err
+	}
+	cli.conn = udpconn
+	go cli.writeRoutine()
+	go cli.readRoutine()
+	go cli.epochRoutine()
+	go cli.eventHandlerRoutine();
+	msg := NewConnect();
+	cli.msgConnectChan <- msg
+	select {
+	case <- cli.initChan:
+		return Client(cli), nil;
+	case <- cli.closeChan:
+		return nil, errors.New("client init failed")
+	}
 }
 
 func (c *client) ConnID() int {
-	return -1
+	return c.connId
 }
 
 func (c *client) Read() ([]byte, error) {
-	// TODO: remove this line when you are ready to begin implementing this method.
-	select {} // Blocks indefinitely.
-	return nil, errors.New("not yet implemented")
+	select {
+	case msg := <- c.msgReceivedChan:
+		return msg.Payload, nil
+	case <- c.closeChan:
+		return nil, errors.New("client is closed")
+	}
 }
 
 func (c *client) Write(payload []byte) error {
-	return errors.New("not yet implemented")
+	c.msgToWriteCacheChan <- payload
+	return nil
 }
 
 func (c *client) Close() error {
-	return errors.New("not yet implemented")
+	for i := 0; i < 4; i++ {
+		c.closeChan <- true
+	}
+	c.conn.Close()
+	return nil;
+}
+
+func (c *client) writeRoutine()  {
+	for {
+		select {
+		case msg := <-c.msgConnectChan:
+			msgData, _ := json.Marshal(msg)
+			c.conn.Write(msgData)
+		case <-c.closeChan:
+			return
+		}
+	}
+}
+
+func (c *client) readRoutine() {
+	var buf [MTU]byte;
+	var msg Message;
+	for {
+		n, err := c.conn.Read(buf)
+		if err != nil {
+			fmt.Printf("read failed, exit read routine, err="+err)
+			return
+		}
+		e := json.Unmarshal(buf[0:n], msg);
+		if e != nil {
+			continue
+		}
+		c.msgToProcessChan <- msg;
+	}
+}
+
+func (c *client) epochRoutine() {
+	tick := time.Tick(time.Duration(c.epochMillis) * time.Millisecond)
+	for {
+		select {
+		case <-tick:
+			c.epochSignalChan <- true
+		case <-c.closeChan:
+			return
+		}
+	}
+}
+
+func (c *client) eventHandlerRoutine() {
+	for {
+		select {
+		case msg := <-c.msgToProcessChan:
+			c.epochCount = 0;
+			if msg.Type == MsgData {
+				c.msgReceivedQueue.PushBack(msg)
+				if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+					c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+				}
+				ack := NewAck(c.connId, msg.SeqNum)
+				c.msgConnectChan <- ack
+				c.msgReceivedChan <- msg
+			} else if msg.Type == MsgAck {
+				if msg.SeqNum == 0 {
+					c.connId = msg.ConnID
+					c.nextSeqNum++
+					c.initChan <- true
+				} else {
+					if msg.SeqNum == c.writeNotAckEarliest {
+						oldEarliest := c.writeNotAckEarliest
+						c.writeNotAckEarliest++
+						c.msgWrittenAckMap[msg.SeqNum] = true
+						delete(c.msgWrittenMap, msg.SeqNum)
+						i := c.writeNotAckEarliest
+						for {
+							isAck, ok := c.msgWrittenAckMap[i]
+							if !ok || !isAck {
+								break
+							}
+							c.writeNotAckEarliest++
+							delete(c.msgWrittenMap, i)
+							delete(c.msgWrittenAckMap, i)
+							i++
+						}
+						for i := 0; i < c.writeNotAckEarliest - oldEarliest && c.msgToWriteQueue.Len() > 0; i++ {
+							cacheMsg := c.msgToWriteQueue.Front()
+							c.msgToWriteQueue.Remove(cacheMsg)
+							c.msgConnectChan <- cacheMsg
+							c.msgWrittenMap[msg.SeqNum] = msg
+							c.msgWrittenAckMap[msg.SeqNum] = false
+						}
+					} else if msg.SeqNum > c.writeNotAckEarliest {
+						delete(c.msgWrittenMap, msg.SeqNum)
+						c.msgWrittenAckMap[msg.SeqNum] = true
+					} else {
+						fmt.Printf("receive duplicate ack msg, seqId=" + msg.SeqNum)
+					}
+				}
+			} else {
+				fmt.Printf("msg that type is connect is illegal for client, seqId="+msg.SeqNum)
+			}
+		case payload := <-c.msgToWriteCacheChan:
+			msg := NewData(c.connId, c.nextSeqNum, payload)
+			c.nextSeqNum++
+			if msg.SeqNum < c.writeNotAckEarliest + c.windowSize {
+				c.msgConnectChan <- msg
+				c.msgWrittenMap[msg.SeqNum] = msg
+				c.msgWrittenAckMap[msg.SeqNum] = false
+			} else {
+				c.msgToWriteQueue.PushBack(msg)
+			}
+		case <- c.epochSignalChan:
+			c.epochCount++
+			if c.epochCount >= c.epochLimit {
+				if c.connId == 0 {
+					c.Close()
+					c.shutdownChan <- true
+					continue
+				}
+			}
+			if c.connId == 0 {
+				msg := NewConnect();
+				c.msgConnectChan <- msg;
+			} else {
+				if c.nextSeqNum == 1 {
+					msg := NewData(c.connId, 0, nil)
+					c.msgConnectChan <- msg
+				} else {
+					for k, v := range c.msgWrittenMap {
+						if isAck, ok := c.msgWrittenAckMap[k];  ok{
+							if !isAck {
+								c.msgConnectChan <- v
+							}
+						}
+					}
+					for iter := c.msgReceivedQueue.Front(); iter != nil; iter = iter.Next() {
+						msg := NewAck(c.connId, iter.Value.(Message).SeqNum)
+						c.msgConnectChan <- msg
+					}
+				}
+			}
+		case <- c.closeChan:
+			return
+		}
+	}
 }
