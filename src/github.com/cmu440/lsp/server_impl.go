@@ -6,6 +6,23 @@ import "errors"
 
 type server struct {
 	// TODO: implement this!
+	port int
+	epochLimit int
+	epochMillis int
+	windowSize int
+	//init
+	initChan chan bool
+	shutdownChan chan bool
+	//read
+	msgReceivedChan chan Message
+	//close
+	closeChan chan bool
+	//epoch
+	epochSignalChan chan bool
+	epochCount int
+}
+
+type clientInfo struct {
 
 }
 
