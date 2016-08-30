@@ -66,10 +66,10 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		msgWrittenAckMap: make(map[int]bool),
 		msgToWriteCacheChan: make(chan []byte),
 		msgToWriteQueue: list.New(),
-		msgConnectChan: make(chan Message),
+		msgConnectChan: make(chan Message, params.WindowSize),
 		msgReceivedQueue: list.New(),
 		msgToProcessChan: make(chan  Message),
-		msgReceivedChan: make(chan Message),
+		msgReceivedChan: make(chan Message, params.WindowSize),
 		closeChan: make(chan(bool), 5),
 		epochCount: 0,
 		epochSignalChan: make(chan bool),
@@ -165,7 +165,7 @@ func (c *client) epochRoutine() {
 		case <-tick:
 			c.epochSignalChan <- true
 		case <-c.closeChan:
-			fmt.Println("epoch routing exit")
+			fmt.Println("client epoch routing exit")
 			return
 		}
 	}
@@ -251,7 +251,7 @@ func (c *client) eventHandlerRoutine() {
 				c.msgConnectChan <- *msg;
 			} else {
 				if c.nextSeqNum == 1 {
-					msg := NewData(c.connId, 0, nil)
+					msg := NewAck(c.connId, 0)
 					c.msgConnectChan <- *msg
 				} else {
 					for k, v := range c.msgWrittenMap {
