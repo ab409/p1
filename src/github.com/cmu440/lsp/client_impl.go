@@ -9,6 +9,7 @@ import (
 	"time"
 	"container/list"
 	"github.com/cmu440/lspnet"
+	"strconv"
 )
 
 const MTU = 1500
@@ -217,7 +218,7 @@ func (c *client) eventHandlerRoutine() {
 						delete(c.msgWrittenMap, msg.SeqNum)
 						c.msgWrittenAckMap[msg.SeqNum] = true
 					} else {
-						fmt.Println("receive duplicate ack msg")
+						fmt.Println("receive duplicate ack msg, seqNum=" + strconv.Itoa(msg.SeqNum))
 					}
 				}
 			} else {

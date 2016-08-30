@@ -6,6 +6,7 @@ import "errors"
 
 type server struct {
 	// TODO: implement this!
+
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
