@@ -94,7 +94,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	select {
 	case <- cli.initChan:
 		return Client(cli), nil;
-	case <- cli.closeChan:
+	case <- cli.shutdownChan:
 		return nil, errors.New("client init failed")
 	}
 }
@@ -183,6 +183,7 @@ func (c *client) eventHandlerRoutine() {
 				if msg.SeqNum == 0 {
 					c.connId = msg.ConnID
 					c.nextSeqNum++
+					c.writeNotAckEarliest++
 					c.initChan <- true
 				} else {
 					if msg.SeqNum == c.writeNotAckEarliest {
