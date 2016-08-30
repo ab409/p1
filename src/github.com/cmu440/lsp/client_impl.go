@@ -4,7 +4,6 @@ package lsp
 
 import (
 	"errors"
-	"net"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -15,7 +14,7 @@ import (
 const MTU = 1500
 
 type client struct {
-	conn                net.Conn
+	conn                *lspnet.UDPConn
 	connId              int             //if connId = 0, then the client is not init successfully yet. the epoch routine will use this
 	epochLimit          int             // params
 	epochMillis         int
@@ -54,7 +53,6 @@ type client struct {
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
 	cli := &client{
-		conn: nil,
 		connId: 0,
 		epochLimit: params.EpochLimit,
 		epochMillis: params.EpochMillis,
@@ -71,7 +69,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		msgReceivedQueue: list.New(),
 		msgToProcessChan: make(chan  Message),
 		msgReceivedChan: make(chan Message),
-		closeChan: make(chan bool),
+		closeChan: make(chan(bool), 5),
 		epochCount: 0,
 		epochSignalChan: make(chan bool),
 	}
@@ -90,11 +88,13 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	go cli.epochRoutine()
 	go cli.eventHandlerRoutine();
 	msg := NewConnect();
-	cli.msgConnectChan <- msg
+	cli.msgConnectChan <- *msg
 	select {
 	case <- cli.initChan:
+		fmt.Println("client init success")
 		return Client(cli), nil;
 	case <- cli.shutdownChan:
+		fmt.Println("cli shut down")
 		return nil, errors.New("client init failed")
 	}
 }
@@ -118,7 +118,7 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 3; i++ {
 		c.closeChan <- true
 	}
 	c.conn.Close()
@@ -130,8 +130,10 @@ func (c *client) writeRoutine()  {
 		select {
 		case msg := <-c.msgConnectChan:
 			msgData, _ := json.Marshal(msg)
+			fmt.Println("write msg =" + string(msgData))
 			c.conn.Write(msgData)
 		case <-c.closeChan:
+			fmt.Println("write routine exit")
 			return
 		}
 	}
@@ -141,9 +143,10 @@ func (c *client) readRoutine() {
 	var buf [MTU]byte;
 	var msg Message;
 	for {
-		n, err := c.conn.Read(buf)
+		n, err := c.conn.Read(buf[:])
+		fmt.Println("read msg =" + string(buf[0:n]))
 		if err != nil {
-			fmt.Printf("read failed, exit read routine, err="+err)
+			fmt.Println("read failed, read routine exit")
 			return
 		}
 		e := json.Unmarshal(buf[0:n], msg);
@@ -161,6 +164,7 @@ func (c *client) epochRoutine() {
 		case <-tick:
 			c.epochSignalChan <- true
 		case <-c.closeChan:
+			fmt.Println("epoch routing exit")
 			return
 		}
 	}
@@ -177,7 +181,7 @@ func (c *client) eventHandlerRoutine() {
 					c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
 				}
 				ack := NewAck(c.connId, msg.SeqNum)
-				c.msgConnectChan <- ack
+				c.msgConnectChan <- *ack
 				c.msgReceivedChan <- msg
 			} else if msg.Type == MsgAck {
 				if msg.SeqNum == 0 {
@@ -205,7 +209,7 @@ func (c *client) eventHandlerRoutine() {
 						for i := 0; i < c.writeNotAckEarliest - oldEarliest && c.msgToWriteQueue.Len() > 0; i++ {
 							cacheMsg := c.msgToWriteQueue.Front()
 							c.msgToWriteQueue.Remove(cacheMsg)
-							c.msgConnectChan <- cacheMsg
+							c.msgConnectChan <- cacheMsg.Value.(Message)
 							c.msgWrittenMap[msg.SeqNum] = msg
 							c.msgWrittenAckMap[msg.SeqNum] = false
 						}
@@ -213,18 +217,18 @@ func (c *client) eventHandlerRoutine() {
 						delete(c.msgWrittenMap, msg.SeqNum)
 						c.msgWrittenAckMap[msg.SeqNum] = true
 					} else {
-						fmt.Printf("receive duplicate ack msg, seqId=" + msg.SeqNum)
+						fmt.Println("receive duplicate ack msg")
 					}
 				}
 			} else {
-				fmt.Printf("msg that type is connect is illegal for client, seqId="+msg.SeqNum)
+				fmt.Println("msg that type is connect is illegal for client")
 			}
 		case payload := <-c.msgToWriteCacheChan:
 			msg := NewData(c.connId, c.nextSeqNum, payload)
 			c.nextSeqNum++
 			if msg.SeqNum < c.writeNotAckEarliest + c.windowSize {
-				c.msgConnectChan <- msg
-				c.msgWrittenMap[msg.SeqNum] = msg
+				c.msgConnectChan <- *msg
+				c.msgWrittenMap[msg.SeqNum] = *msg
 				c.msgWrittenAckMap[msg.SeqNum] = false
 			} else {
 				c.msgToWriteQueue.PushBack(msg)
@@ -236,15 +240,18 @@ func (c *client) eventHandlerRoutine() {
 					c.Close()
 					c.shutdownChan <- true
 					continue
+				} else {
+					c.Close()
+					continue
 				}
 			}
 			if c.connId == 0 {
 				msg := NewConnect();
-				c.msgConnectChan <- msg;
+				c.msgConnectChan <- *msg;
 			} else {
 				if c.nextSeqNum == 1 {
 					msg := NewData(c.connId, 0, nil)
-					c.msgConnectChan <- msg
+					c.msgConnectChan <- *msg
 				} else {
 					for k, v := range c.msgWrittenMap {
 						if isAck, ok := c.msgWrittenAckMap[k];  ok{
@@ -255,11 +262,12 @@ func (c *client) eventHandlerRoutine() {
 					}
 					for iter := c.msgReceivedQueue.Front(); iter != nil; iter = iter.Next() {
 						msg := NewAck(c.connId, iter.Value.(Message).SeqNum)
-						c.msgConnectChan <- msg
+						c.msgConnectChan <- *msg
 					}
 				}
 			}
 		case <- c.closeChan:
+			fmt.Println("event handler exit")
 			return
 		}
 	}
