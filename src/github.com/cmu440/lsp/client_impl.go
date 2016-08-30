@@ -231,7 +231,7 @@ func (c *client) eventHandlerRoutine() {
 				c.msgWrittenMap[msg.SeqNum] = *msg
 				c.msgWrittenAckMap[msg.SeqNum] = false
 			} else {
-				c.msgToWriteQueue.PushBack(msg)
+				c.msgToWriteQueue.PushBack(*msg)
 			}
 		case <- c.epochSignalChan:
 			c.epochCount++
