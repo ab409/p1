@@ -32,15 +32,18 @@ type client struct {
 	msgToWriteQueue     *list.List      //if msg seqNum >= writeNotAckEarList + windowSize, then msg that from msgToWriteCacheChan will write this queue first, when receive ack, the queue will write msg to msgConnectChan
 	msgConnectChan      chan Message    //the writeChan will read this chan and write to chan
 					    //read
-	msgReceivedQueue     *list.List     //only save msg that type = MsgData
-	msgToProcessChan     chan Message   //receive msg, not process
-	msgReceivedChan      chan Message   //processed msg, call Read to read msg from this chan
-	readHasAckSeqNum     int
+	msgReceivedQueue    *list.List     //only save msg that type = MsgData
+	msgToProcessChan    chan Message   //receive msg, not process
+	msgReceivedChan     chan Message   //processed msg, call Read to read msg from this chan
+	receiveHasAckSeqNum int
+	receivedMsgNotAckMap	    map[int]bool
+	receivedMsgMap map[int] Message
+
 					    //close
-	closeChan            chan bool      //use poison pills to close client
+	closeChan           chan bool      //use poison pills to close client
 					    //epoch
-	epochCount           int
-	epochSignalChan      chan bool
+	epochCount          int
+	epochSignalChan     chan bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -74,7 +77,9 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		msgReceivedQueue: list.New(),
 		msgToProcessChan: make(chan  Message),
 		msgReceivedChan: make(chan Message, 1000),
-		readHasAckSeqNum: 1,
+		receiveHasAckSeqNum: 0,
+		receivedMsgNotAckMap: make(map[int]bool),
+		receivedMsgMap: make(map[int]Message),
 
 		closeChan: make(chan(bool), 5),
 		epochCount: 0,
@@ -180,13 +185,42 @@ func (c *client) eventHandlerRoutine() {
 		case msg := <-c.msgToProcessChan:
 			c.epochCount = 0;
 			if msg.Type == MsgData {
-				c.msgReceivedQueue.PushBack(msg)
-				if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
-					c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+				if msg.SeqNum <= c.receiveHasAckSeqNum {
+					fmt.Printf("receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
+					ack := NewAck(c.connId, msg.SeqNum)
+					c.msgConnectChan <- *ack
+					continue
+				} else if msg.SeqNum == c.receiveHasAckSeqNum + 1 {
+					c.msgReceivedQueue.PushBack(msg)
+					if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+						c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+					}
+					ack := NewAck(c.connId, msg.SeqNum)
+					c.msgConnectChan <- *ack
+					c.msgReceivedChan <- msg
+					c.receiveHasAckSeqNum++
+					i := c.receiveHasAckSeqNum + 1
+					for ; i < c.receiveHasAckSeqNum +c.windowSize; i++{
+						isReceived, ok := c.receivedMsgNotAckMap[i]
+						if !ok || !isReceived {
+							break;
+						}
+						ack := NewAck(c.connId, c.receivedMsgMap[i].SeqNum)
+						c.msgConnectChan <- *ack
+						c.msgReceivedChan <- c.receivedMsgMap[c.receiveHasAckSeqNum+i]
+					}
+					c.receiveHasAckSeqNum = i - 1
+				} else if msg.SeqNum < c.receiveHasAckSeqNum + c.windowSize{
+					c.receivedMsgMap[msg.SeqNum] = msg
+					c.receivedMsgNotAckMap[msg.SeqNum] = true
+					ack := NewAck(c.connId, msg.SeqNum)
+					c.msgConnectChan <- *ack
+				} else {
+					c.receivedMsgMap[msg.SeqNum] = msg
+					c.receivedMsgNotAckMap[msg.SeqNum] = true
+					ack := NewAck(c.connId, msg.SeqNum)
+					c.msgConnectChan <- *ack
 				}
-				ack := NewAck(c.connId, msg.SeqNum)
-				c.msgConnectChan <- *ack
-				c.msgReceivedChan <- msg
 			} else if msg.Type == MsgAck {
 				if msg.SeqNum == 0 {
 					c.connId = msg.ConnID
@@ -214,8 +248,8 @@ func (c *client) eventHandlerRoutine() {
 							cacheMsg := c.msgToWriteQueue.Front()
 							c.msgToWriteQueue.Remove(cacheMsg)
 							c.msgConnectChan <- cacheMsg.Value.(Message)
-							c.msgWrittenMap[msg.SeqNum] = msg
-							c.msgWrittenAckMap[msg.SeqNum] = false
+							c.msgWrittenMap[cacheMsg.Value.(Message).SeqNum] = cacheMsg.Value.(Message)
+							c.msgWrittenAckMap[cacheMsg.Value.(Message).SeqNum] = false
 						}
 					} else if msg.SeqNum > c.writeNotAckEarliest {
 						delete(c.msgWrittenMap, msg.SeqNum)
