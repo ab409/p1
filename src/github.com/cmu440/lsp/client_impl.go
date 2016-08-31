@@ -72,11 +72,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		msgWrittenAckMap: make(map[int]bool),
 		msgToWriteCacheChan: make(chan []byte),
 		msgToWriteQueue: list.New(),
-		msgConnectChan: make(chan Message, params.WindowSize),
+		msgConnectChan: make(chan Message, 10000),
 
 		msgReceivedQueue: list.New(),
 		msgToProcessChan: make(chan  Message),
-		msgReceivedChan: make(chan Message, 1000),
+		msgReceivedChan: make(chan Message, 10000),
 		receiveHasAckSeqNum: 0,
 		receivedMsgNotAckMap: make(map[int]bool),
 		receivedMsgMap: make(map[int]Message),
@@ -186,11 +186,12 @@ func (c *client) eventHandlerRoutine() {
 			c.epochCount = 0;
 			if msg.Type == MsgData {
 				if msg.SeqNum <= c.receiveHasAckSeqNum {
-					fmt.Printf("receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
+					fmt.Printf("process receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
 					ack := NewAck(c.connId, msg.SeqNum)
 					c.msgConnectChan <- *ack
 					continue
 				} else if msg.SeqNum == c.receiveHasAckSeqNum + 1 {
+					fmt.Printf("process receive data msg, seqNum=%d\n", msg.SeqNum)
 					c.msgReceivedQueue.PushBack(msg)
 					if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
 						c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
@@ -200,14 +201,14 @@ func (c *client) eventHandlerRoutine() {
 					c.msgReceivedChan <- msg
 					c.receiveHasAckSeqNum++
 					i := c.receiveHasAckSeqNum + 1
-					for ; i < c.receiveHasAckSeqNum +c.windowSize; i++{
+					for ; i <= c.receiveHasAckSeqNum +c.windowSize; i++{
 						isReceived, ok := c.receivedMsgNotAckMap[i]
 						if !ok || !isReceived {
 							break;
 						}
 						ack := NewAck(c.connId, c.receivedMsgMap[i].SeqNum)
 						c.msgConnectChan <- *ack
-						c.msgReceivedChan <- c.receivedMsgMap[c.receiveHasAckSeqNum+i]
+						c.msgReceivedChan <- c.receivedMsgMap[i]
 					}
 					c.receiveHasAckSeqNum = i - 1
 				} else if msg.SeqNum < c.receiveHasAckSeqNum + c.windowSize{
@@ -220,6 +221,11 @@ func (c *client) eventHandlerRoutine() {
 					c.receivedMsgNotAckMap[msg.SeqNum] = true
 					ack := NewAck(c.connId, msg.SeqNum)
 					c.msgConnectChan <- *ack
+					for i := c.receiveHasAckSeqNum + 1; i <= msg.SeqNum - c.windowSize; i++ {
+						delete(c.receivedMsgMap, i)
+						delete(c.receivedMsgNotAckMap, i)
+					}
+					c.receiveHasAckSeqNum = msg.SeqNum - c.windowSize
 				}
 			} else if msg.Type == MsgAck {
 				if msg.SeqNum == 0 {
