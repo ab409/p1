@@ -5,14 +5,19 @@ package lsp
 import (
 	"errors"
 	"encoding/json"
-	"fmt"
 	"time"
 	"container/list"
 	"github.com/cmu440/lspnet"
 	"strconv"
+	"log"
+	"os"
 )
 
 const MTU = 1500
+
+var (
+	clientLogFile, _ = os.OpenFile("client_log.txt", os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0)
+)
 
 type client struct {
 	conn                *lspnet.UDPConn
@@ -44,6 +49,8 @@ type client struct {
 					    //epoch
 	epochCount          int
 	epochSignalChan     chan bool
+	//log
+	logger *log.Logger
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -84,6 +91,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		closeChan: make(chan(bool), 5),
 		epochCount: 0,
 		epochSignalChan: make(chan bool),
+		logger: log.New(clientLogFile, "Client-- ", log.Lmicroseconds|log.Lshortfile),
 	}
 
 	udpaddr, err := lspnet.ResolveUDPAddr("udp", hostport)
@@ -103,10 +111,10 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	cli.msgConnectChan <- *msg
 	select {
 	case <- cli.initChan:
-		fmt.Println("client init success")
+		cli.logger.Println("client init success")
 		return Client(cli), nil;
 	case <- cli.shutdownChan:
-		fmt.Println("cli shut down")
+		cli.logger.Println("cli shut down")
 		return nil, errors.New("client init failed")
 	}
 }
@@ -142,10 +150,10 @@ func (c *client) writeRoutine()  {
 		select {
 		case msg := <-c.msgConnectChan:
 			msgData, _ := json.Marshal(msg)
-			fmt.Printf("write msg = %s, payload=%s \n", string(msgData), string(msg.Payload))
+			c.logger.Printf("write msg = %s, payload=%s \n", string(msgData), string(msg.Payload))
 			c.conn.Write(msgData)
 		case <-c.closeChan:
-			fmt.Println("write routine exit")
+			c.logger.Println("write routine exit")
 			return
 		}
 	}
@@ -157,11 +165,11 @@ func (c *client) readRoutine() {
 	for {
 		n, err := c.conn.Read(buf[:])
 		if err != nil {
-			fmt.Println("read failed, read routine exit")
+			c.logger.Println("read failed")
 			return
 		}
 		json.Unmarshal(buf[0:n], &msg);
-		fmt.Printf("read msg = %s, payload= %s\n", string(buf[0:n]), string(msg.Payload))
+		c.logger.Printf("read msg = %s, payload= %s\n", string(buf[0:n]), string(msg.Payload))
 		c.msgToProcessChan <- msg;
 	}
 }
@@ -173,7 +181,7 @@ func (c *client) epochRoutine() {
 		case <-tick:
 			c.epochSignalChan <- true
 		case <-c.closeChan:
-			fmt.Println("client epoch routing exit")
+			c.logger.Println("client epoch routing exit")
 			return
 		}
 	}
@@ -186,12 +194,12 @@ func (c *client) eventHandlerRoutine() {
 			c.epochCount = 0;
 			if msg.Type == MsgData {
 				if msg.SeqNum <= c.receiveHasAckSeqNum {
-					fmt.Printf("process receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
+					c.logger.Printf("process receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
 					ack := NewAck(c.connId, msg.SeqNum)
 					c.msgConnectChan <- *ack
 					continue
 				} else if msg.SeqNum == c.receiveHasAckSeqNum + 1 {
-					fmt.Printf("process receive data msg, seqNum=%d\n", msg.SeqNum)
+					c.logger.Printf("process receive data msg, seqNum=%d\n", msg.SeqNum)
 					c.msgReceivedQueue.PushBack(msg)
 					if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
 						c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
@@ -261,11 +269,11 @@ func (c *client) eventHandlerRoutine() {
 						delete(c.msgWrittenMap, msg.SeqNum)
 						c.msgWrittenAckMap[msg.SeqNum] = true
 					} else {
-						fmt.Println("receive duplicate ack msg, seqNum=" + strconv.Itoa(msg.SeqNum))
+						c.logger.Println("receive duplicate ack msg, seqNum=" + strconv.Itoa(msg.SeqNum))
 					}
 				}
 			} else {
-				fmt.Println("msg that type is connect is illegal for client")
+				c.logger.Println("msg that type is connect is illegal for client")
 			}
 		case payload := <-c.msgToWriteCacheChan:
 			msg := NewData(c.connId, c.writeNextSeqNum, payload)
@@ -290,12 +298,12 @@ func (c *client) eventHandlerRoutine() {
 				}
 			}
 			if c.connId == 0 {
-				fmt.Println("epoch resend connect msg")
+				c.logger.Println("epoch resend connect msg")
 				msg := NewConnect();
 				c.msgConnectChan <- *msg;
 			} else {
 				if c.writeNextSeqNum == 1 {
-					fmt.Println("epoch send msg seqNum = 0")
+					c.logger.Println("epoch send msg seqNum = 0")
 					msg := NewAck(c.connId, 0)
 					c.msgConnectChan <- *msg
 				} else {
@@ -313,7 +321,7 @@ func (c *client) eventHandlerRoutine() {
 				}
 			}
 		case <- c.closeChan:
-			fmt.Println("event handler exit")
+			c.logger.Println("event handler exit")
 			return
 		}
 	}
