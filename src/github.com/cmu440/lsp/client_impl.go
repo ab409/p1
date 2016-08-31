@@ -138,10 +138,10 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
+	c.conn.Close()
 	for i := 0; i < 3; i++ {
 		c.closeChan <- true
 	}
-	c.conn.Close()
 	return nil;
 }
 
@@ -287,7 +287,7 @@ func (c *client) eventHandlerRoutine() {
 			}
 		case <- c.epochSignalChan:
 			c.epochCount++
-			if c.epochCount >= c.epochLimit {
+			if c.epochCount > c.epochLimit {
 				if c.connId == 0 {
 					c.Close()
 					c.shutdownChan <- true
