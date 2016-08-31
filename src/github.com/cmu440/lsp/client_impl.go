@@ -77,12 +77,12 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		writeNotAckEarliest: 0,
 		msgWrittenMap: make(map[int]Message),
 		msgWrittenAckMap: make(map[int]bool),
-		msgToWriteCacheChan: make(chan []byte),
+		msgToWriteCacheChan: make(chan []byte, 10000),
 		msgToWriteQueue: list.New(),
 		msgConnectChan: make(chan Message, 10000),
 
 		msgReceivedQueue: list.New(),
-		msgToProcessChan: make(chan  Message),
+		msgToProcessChan: make(chan Message, 10000),
 		msgReceivedChan: make(chan Message, 10000),
 		receiveHasAckSeqNum: 0,
 		receivedMsgNotAckMap: make(map[int]bool),
@@ -90,7 +90,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 
 		closeChan: make(chan(bool), 5),
 		epochCount: 0,
-		epochSignalChan: make(chan bool),
+		epochSignalChan: make(chan bool, 100),
 		logger: log.New(clientLogFile, "Client-- ", log.Lmicroseconds|log.Lshortfile),
 	}
 
@@ -153,7 +153,7 @@ func (c *client) writeRoutine()  {
 			c.logger.Printf("write msg = %s, payload=%s \n", string(msgData), string(msg.Payload))
 			c.conn.Write(msgData)
 		case <-c.closeChan:
-			c.logger.Println("write routine exit")
+			c.logger.Printf("client %d write routine exit\n", c.connId)
 			return
 		}
 	}
@@ -165,10 +165,14 @@ func (c *client) readRoutine() {
 	for {
 		n, err := c.conn.Read(buf[:])
 		if err != nil {
-			c.logger.Println("read failed")
+			c.logger.Printf("client %d read failed\n", c.connId)
 			return
 		}
-		json.Unmarshal(buf[0:n], &msg);
+		e := json.Unmarshal(buf[0:n], &msg);
+		if e != nil {
+			c.logger.Printf("client read routine unmarshal json failed")
+			continue
+		}
 		c.logger.Printf("read msg = %s, payload= %s\n", string(buf[0:n]), string(msg.Payload))
 		c.msgToProcessChan <- msg;
 	}
@@ -193,10 +197,10 @@ func (c *client) eventHandlerRoutine() {
 		case msg := <-c.msgToProcessChan:
 			c.epochCount = 0;
 			if msg.Type == MsgData {
-				if msg.SeqNum <= c.receiveHasAckSeqNum {
+				ack := NewAck(c.connId, msg.SeqNum)
+				c.msgConnectChan <- *ack
+				if msg.SeqNum < c.receiveHasAckSeqNum + 1 {
 					c.logger.Printf("process receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
-					ack := NewAck(c.connId, msg.SeqNum)
-					c.msgConnectChan <- *ack
 					continue
 				} else if msg.SeqNum == c.receiveHasAckSeqNum + 1 {
 					c.logger.Printf("process receive data msg, seqNum=%d\n", msg.SeqNum)
@@ -204,8 +208,6 @@ func (c *client) eventHandlerRoutine() {
 					if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
 						c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
 					}
-					ack := NewAck(c.connId, msg.SeqNum)
-					c.msgConnectChan <- *ack
 					c.msgReceivedChan <- msg
 					c.receiveHasAckSeqNum++
 					i := c.receiveHasAckSeqNum + 1
@@ -214,26 +216,36 @@ func (c *client) eventHandlerRoutine() {
 						if !ok || !isReceived {
 							break;
 						}
-						ack := NewAck(c.connId, c.receivedMsgMap[i].SeqNum)
-						c.msgConnectChan <- *ack
+						//ack := NewAck(c.connId, c.receivedMsgMap[i].SeqNum)
+						//c.msgConnectChan <- *ack
 						c.msgReceivedChan <- c.receivedMsgMap[i]
 					}
 					c.receiveHasAckSeqNum = i - 1
-				} else if msg.SeqNum < c.receiveHasAckSeqNum + c.windowSize{
-					c.receivedMsgMap[msg.SeqNum] = msg
-					c.receivedMsgNotAckMap[msg.SeqNum] = true
-					ack := NewAck(c.connId, msg.SeqNum)
-					c.msgConnectChan <- *ack
-				} else {
-					c.receivedMsgMap[msg.SeqNum] = msg
-					c.receivedMsgNotAckMap[msg.SeqNum] = true
-					ack := NewAck(c.connId, msg.SeqNum)
-					c.msgConnectChan <- *ack
-					for i := c.receiveHasAckSeqNum + 1; i <= msg.SeqNum - c.windowSize; i++ {
-						delete(c.receivedMsgMap, i)
-						delete(c.receivedMsgNotAckMap, i)
+				} else if msg.SeqNum <= c.receiveHasAckSeqNum + c.windowSize{
+					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
+						c.logger.Printf("process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
+						c.msgReceivedQueue.PushBack(msg)
+						if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+						}
+						c.receivedMsgMap[msg.SeqNum] = msg
+						c.receivedMsgNotAckMap[msg.SeqNum] = true
 					}
-					c.receiveHasAckSeqNum = msg.SeqNum - c.windowSize
+				} else {
+					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
+						c.logger.Printf("process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
+						c.msgReceivedQueue.PushBack(msg)
+						if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+						}
+						c.receivedMsgMap[msg.SeqNum] = msg
+						c.receivedMsgNotAckMap[msg.SeqNum] = true
+						for i := c.receiveHasAckSeqNum + 1; i <= msg.SeqNum - c.windowSize; i++ {
+							delete(c.receivedMsgMap, i)
+							delete(c.receivedMsgNotAckMap, i)
+						}
+						c.receiveHasAckSeqNum = msg.SeqNum - c.windowSize
+					}
 				}
 			} else if msg.Type == MsgAck {
 				if msg.SeqNum == 0 {
@@ -245,7 +257,7 @@ func (c *client) eventHandlerRoutine() {
 					if msg.SeqNum == c.writeNotAckEarliest {
 						oldEarliest := c.writeNotAckEarliest
 						c.writeNotAckEarliest++
-						c.msgWrittenAckMap[msg.SeqNum] = true
+						delete(c.msgWrittenAckMap, msg.SeqNum)
 						delete(c.msgWrittenMap, msg.SeqNum)
 						i := c.writeNotAckEarliest
 						for {
@@ -254,12 +266,15 @@ func (c *client) eventHandlerRoutine() {
 								break
 							}
 							c.writeNotAckEarliest++
-							delete(c.msgWrittenMap, i)
 							delete(c.msgWrittenAckMap, i)
 							i++
 						}
-						for i := 0; i < c.writeNotAckEarliest - oldEarliest && c.msgToWriteQueue.Len() > 0; i++ {
+						for i := 0; i < c.writeNotAckEarliest - oldEarliest && i < c.windowSize && c.msgToWriteQueue.Len() > 0; i++ {
 							cacheMsg := c.msgToWriteQueue.Front()
+							curSeqNum := cacheMsg.Value.(Message).SeqNum
+							if curSeqNum > c.writeNotAckEarliest+c.windowSize-1{
+								break
+							}
 							c.msgToWriteQueue.Remove(cacheMsg)
 							c.msgConnectChan <- cacheMsg.Value.(Message)
 							c.msgWrittenMap[cacheMsg.Value.(Message).SeqNum] = cacheMsg.Value.(Message)
@@ -321,7 +336,7 @@ func (c *client) eventHandlerRoutine() {
 				}
 			}
 		case <- c.closeChan:
-			c.logger.Println("event handler exit")
+			c.logger.Printf("client %d event handler exit\n", c.connId)
 			return
 		}
 	}
