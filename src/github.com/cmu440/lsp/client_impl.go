@@ -150,10 +150,7 @@ func (c *client) readRoutine() {
 			fmt.Println("read failed, read routine exit")
 			return
 		}
-		e := json.Unmarshal(buf[0:n], msg);
-		if e != nil {
-			continue
-		}
+		json.Unmarshal(buf[0:n], &msg);
 		c.msgToProcessChan <- msg;
 	}
 }
@@ -247,10 +244,12 @@ func (c *client) eventHandlerRoutine() {
 				}
 			}
 			if c.connId == 0 {
+				fmt.Println("epoch resend connect msg")
 				msg := NewConnect();
 				c.msgConnectChan <- *msg;
 			} else {
 				if c.nextSeqNum == 1 {
+					fmt.Println("epoch send msg seqNum = 0")
 					msg := NewAck(c.connId, 0)
 					c.msgConnectChan <- *msg
 				} else {
