@@ -10,6 +10,12 @@ import (
 	"fmt"
 	"time"
 	"encoding/json"
+	"os"
+	"log"
+)
+
+var (
+	serverLogFile, _ = os.OpenFile("server_log.txt", os.O_RDWR|os.O_TRUNC, 0)
 )
 
 type server struct {
@@ -28,29 +34,35 @@ type server struct {
 	//close
 	closeChan chan bool
 	isShutdown bool
+
+	//log
+	logger *log.Logger
 }
 
 type clientInfo struct {
-	server           *server
-	connId           int
-	conn             *lspnet.UDPConn
-	//read
-	msgReceivedQueue     *list.List     //only save msg that type = MsgData
-	msgToProcessChan     chan Message   //receive msg, not process
-	msgReceivedChan      chan Message   //processed msg, call Read to read msg from this chan
-	//write
-	msgConnectChan   chan Message
-	msgToWriteQueue  *list.List
-	msgToWriteChan   chan []byte
-	nextSeqNum          int             // next msg seq num
+	server              *server
+	connId              int
+	conn                *lspnet.UDPConn
+					    //read
+	msgReceivedQueue    *list.List      //only save msg that type = MsgData
+	msgToProcessChan    chan Message    //receive msg, not process
+	msgReceivedChan     chan Message    //processed msg, call Read to read msg from this chan
+	receiveHasAckSeqNum int
+	receivedMsgNotAckMap	    map[int]bool
+	receivedMsgMap map[int] Message
+					    //write
+	msgConnectChan      chan Message
+	msgToWriteQueue     *list.List
+	msgToWriteChan      chan []byte
+	writeNextSeqNum     int             // next msg seq num
 	writeNotAckEarliest int
 	msgWrittenMap       map[int]Message //has written to conn, but not receive ack, the epoch will read this and resend msg
 	msgWrittenAckMap    map[int]bool    //when write a msg, will record false, when receive ack, record true
-	//close
-	closeChan        chan bool
-	//epoch
-	epochSignalChan chan bool
-	epochCount int
+					    //close
+	closeChan           chan bool
+					    //epoch
+	epochSignalChan     chan bool
+	epochCount          int
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -76,6 +88,7 @@ func NewServer(port int, params *Params) (Server, error) {
 
 		closeChan: make(chan bool),
 		isShutdown: false,
+		logger: log.New(clientLogFile, "Server-- ", log.Lmicroseconds|log.Lshortfile),
 
 	}
 	udpaddr, err := lspnet.ResolveUDPAddr("udp", "localhost:"+string(strconv.Itoa(s.port)))
@@ -226,25 +239,68 @@ func (c *clientInfo) eventHandlerRoutine() {
 	for {
 		select {
 		case payload := <- c.msgToWriteChan:
-			pMsg := NewData(c.connId, c.nextSeqNum, payload)
-			c.nextSeqNum++
+			pMsg := NewData(c.connId, c.writeNextSeqNum, payload)
+			c.writeNextSeqNum++
 			if pMsg.SeqNum < c.writeNotAckEarliest + c.server.windowSize {
 				c.msgConnectChan <- *pMsg
 				c.msgWrittenMap[pMsg.SeqNum] = *pMsg
-				c.msgWrittenAckMap[pMsg.SeqNum] = *pMsg
+				c.msgWrittenAckMap[pMsg.SeqNum] = false
 			} else {
 				c.msgToWriteQueue.PushBack(*pMsg)
 			}
 		case msg := <- c.msgToProcessChan:
 			c.epochCount = 0
 			if msg.Type == MsgData {
-				c.msgReceivedQueue.PushBack(msg)
-				if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
-					c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+				pAck := NewAck(c.connId, msg.SeqNum)
+				c.msgConnectChan <- *pAck
+				if msg.SeqNum < c.receiveHasAckSeqNum + 1 {
+					c.server.logger.Printf("server process receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
+					continue
+				} else if msg.SeqNum == c.receiveHasAckSeqNum + 1 {
+					c.server.logger.Printf("server process receive data msg, seqNum=%d\n", msg.SeqNum)
+					c.msgReceivedQueue.PushBack(msg)
+					if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+						c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+					}
+					c.server.msgReceivedChan <- msg
+					c.receiveHasAckSeqNum++
+					i := c.receiveHasAckSeqNum + 1
+					for ; i <= c.receiveHasAckSeqNum + c.server.windowSize; i++{
+						isReceived, ok := c.receivedMsgNotAckMap[i]
+						if !ok || !isReceived {
+							break;
+						}
+						//ack := NewAck(c.connId, c.receivedMsgMap[i].SeqNum)
+						//c.msgConnectChan <- *ack
+						c.server.msgReceivedChan <- c.receivedMsgMap[i]
+					}
+					c.receiveHasAckSeqNum = i - 1
+				} else if msg.SeqNum <= c.receiveHasAckSeqNum + c.server.windowSize {
+					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
+						c.server.logger.Printf("server process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
+						c.msgReceivedQueue.PushBack(msg)
+						if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+						}
+						c.receivedMsgMap[msg.SeqNum] = msg
+						c.receivedMsgNotAckMap[msg.SeqNum] = true
+					}
+				} else {
+					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
+						c.server.logger.Printf("process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
+						c.msgReceivedQueue.PushBack(msg)
+						if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
+							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
+						}
+						c.receivedMsgMap[msg.SeqNum] = msg
+						c.receivedMsgNotAckMap[msg.SeqNum] = true
+						for i := c.receiveHasAckSeqNum + 1; i <= msg.SeqNum - c.server.windowSize; i++ {
+							delete(c.receivedMsgMap, i)
+							delete(c.receivedMsgNotAckMap, i)
+						}
+						c.receiveHasAckSeqNum = msg.SeqNum - c.server.windowSize
+					}
 				}
-				ack := NewAck(c.connId, msg.SeqNum)
-				c.msgConnectChan <- *ack
-				c.server.msgReceivedChan <- msg
 			} else if msg.Type == MsgAck {
 				if msg.SeqNum == 0 {
 					ackMsg := NewAck(c.connId, 0)
@@ -254,6 +310,7 @@ func (c *clientInfo) eventHandlerRoutine() {
 						oldEarliest := c.writeNotAckEarliest
 						c.writeNotAckEarliest++
 						c.msgWrittenAckMap[msg.SeqNum] = true
+						delete(c.msgWrittenAckMap, msg.SeqNum)
 						delete(c.msgWrittenMap, msg.SeqNum)
 						i := c.writeNotAckEarliest
 						for {
@@ -281,14 +338,44 @@ func (c *clientInfo) eventHandlerRoutine() {
 					}
 				}
 			} else if msg.Type == MsgConnect {
-
+				pAckMsg := NewAck(c.connId, 0)
+				c.msgConnectChan <- *pAckMsg
 			}
 		case <- c.epochSignalChan:
-
+			c.epochCount++
+			if c.epochCount > c.server.epochLimit {
+				c.Close()
+				continue
+			}
+			if c.writeNextSeqNum == 1 {
+				c.server.logger.Println("epoch send msg seqNum = 0")
+				msg := NewAck(c.connId, 0)
+				c.msgConnectChan <- *msg
+			} else {
+				for k, v := range c.msgWrittenMap {
+					if isAck, ok := c.msgWrittenAckMap[k]; ok{
+						if !isAck {
+							c.msgConnectChan <- v
+						}
+					}
+				}
+				for iter := c.msgReceivedQueue.Front(); iter != nil; iter = iter.Next() {
+					msg := NewAck(c.connId, iter.Value.(Message).SeqNum)
+					c.msgConnectChan <- *msg
+				}
+			}
 		case <- c.closeChan:
 			fmt.Println("clientInfo eventHandler routine exit")
 			return
 		}
 	}
+}
+
+func (c *clientInfo) Close() error {
+	c.conn.Close()
+	for i := 0; i < 3; i++ {
+		c.closeChan <- true
+	}
+	return nil;
 }
 

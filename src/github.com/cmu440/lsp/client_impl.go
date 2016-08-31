@@ -211,7 +211,7 @@ func (c *client) eventHandlerRoutine() {
 					c.msgReceivedChan <- msg
 					c.receiveHasAckSeqNum++
 					i := c.receiveHasAckSeqNum + 1
-					for ; i <= c.receiveHasAckSeqNum +c.windowSize; i++{
+					for ; i <= c.receiveHasAckSeqNum + c.windowSize; i++{
 						isReceived, ok := c.receivedMsgNotAckMap[i]
 						if !ok || !isReceived {
 							break;
