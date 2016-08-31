@@ -20,24 +20,25 @@ type client struct {
 	epochLimit          int             // params
 	epochMillis         int
 	windowSize          int
-	//init
+					    //init
 	initChan            chan bool
-	shutdownChan	    chan bool
-	//write
-	nextSeqNum          int             // next msg seq num
+	shutdownChan        chan bool
+					    //write
+	writeNextSeqNum     int             // next msg seq num
 	writeNotAckEarliest int
 	msgWrittenMap       map[int]Message //has written to conn, but not receive ack, the epoch will read this and resend msg
 	msgWrittenAckMap    map[int]bool    //when write a msg, will record false, when receive ack, record true
 	msgToWriteCacheChan chan []byte     //when call Write, will mot write msg directly, but write to this chan, the eventHandlerRoutine will write data to msgToWriteChan
 	msgToWriteQueue     *list.List      //if msg seqNum >= writeNotAckEarList + windowSize, then msg that from msgToWriteCacheChan will write this queue first, when receive ack, the queue will write msg to msgConnectChan
 	msgConnectChan      chan Message    //the writeChan will read this chan and write to chan
-	//read
+					    //read
 	msgReceivedQueue     *list.List     //only save msg that type = MsgData
 	msgToProcessChan     chan Message   //receive msg, not process
 	msgReceivedChan      chan Message   //processed msg, call Read to read msg from this chan
-	//close
+	readHasAckSeqNum     int
+					    //close
 	closeChan            chan bool      //use poison pills to close client
-	//epoch
+					    //epoch
 	epochCount           int
 	epochSignalChan      chan bool
 }
@@ -58,18 +59,23 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		epochLimit: params.EpochLimit,
 		epochMillis: params.EpochMillis,
 		windowSize: params.WindowSize,
+
 		initChan: make(chan bool),
 		shutdownChan: make(chan bool),
-		nextSeqNum: 0,
+
+		writeNextSeqNum: 0,
 		writeNotAckEarliest: 0,
 		msgWrittenMap: make(map[int]Message),
 		msgWrittenAckMap: make(map[int]bool),
 		msgToWriteCacheChan: make(chan []byte),
 		msgToWriteQueue: list.New(),
 		msgConnectChan: make(chan Message, params.WindowSize),
+
 		msgReceivedQueue: list.New(),
 		msgToProcessChan: make(chan  Message),
-		msgReceivedChan: make(chan Message, params.WindowSize),
+		msgReceivedChan: make(chan Message, 1000),
+		readHasAckSeqNum: 1,
+
 		closeChan: make(chan(bool), 5),
 		epochCount: 0,
 		epochSignalChan: make(chan bool),
@@ -131,7 +137,7 @@ func (c *client) writeRoutine()  {
 		select {
 		case msg := <-c.msgConnectChan:
 			msgData, _ := json.Marshal(msg)
-			fmt.Println("write msg =" + string(msgData))
+			fmt.Printf("write msg = %s, payload=%s \n", string(msgData), string(msg.Payload))
 			c.conn.Write(msgData)
 		case <-c.closeChan:
 			fmt.Println("write routine exit")
@@ -145,12 +151,12 @@ func (c *client) readRoutine() {
 	var msg Message;
 	for {
 		n, err := c.conn.Read(buf[:])
-		fmt.Println("read msg =" + string(buf[0:n]))
 		if err != nil {
 			fmt.Println("read failed, read routine exit")
 			return
 		}
 		json.Unmarshal(buf[0:n], &msg);
+		fmt.Printf("read msg = %s, payload= %s\n", string(buf[0:n]), string(msg.Payload))
 		c.msgToProcessChan <- msg;
 	}
 }
@@ -184,7 +190,7 @@ func (c *client) eventHandlerRoutine() {
 			} else if msg.Type == MsgAck {
 				if msg.SeqNum == 0 {
 					c.connId = msg.ConnID
-					c.nextSeqNum++
+					c.writeNextSeqNum++
 					c.writeNotAckEarliest++
 					c.initChan <- true
 				} else {
@@ -222,8 +228,8 @@ func (c *client) eventHandlerRoutine() {
 				fmt.Println("msg that type is connect is illegal for client")
 			}
 		case payload := <-c.msgToWriteCacheChan:
-			msg := NewData(c.connId, c.nextSeqNum, payload)
-			c.nextSeqNum++
+			msg := NewData(c.connId, c.writeNextSeqNum, payload)
+			c.writeNextSeqNum++
 			if msg.SeqNum < c.writeNotAckEarliest + c.windowSize {
 				c.msgConnectChan <- *msg
 				c.msgWrittenMap[msg.SeqNum] = *msg
@@ -248,7 +254,7 @@ func (c *client) eventHandlerRoutine() {
 				msg := NewConnect();
 				c.msgConnectChan <- *msg;
 			} else {
-				if c.nextSeqNum == 1 {
+				if c.writeNextSeqNum == 1 {
 					fmt.Println("epoch send msg seqNum = 0")
 					msg := NewAck(c.connId, 0)
 					c.msgConnectChan <- *msg
