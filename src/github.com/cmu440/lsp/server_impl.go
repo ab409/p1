@@ -3,72 +3,59 @@
 package lsp
 
 import (
+	"container/list"
+	"encoding/json"
 	"errors"
 	"github.com/cmu440/lspnet"
-	"container/list"
-	"strconv"
-	"fmt"
-	"time"
-	"encoding/json"
-	"os"
 	"log"
+	"os"
+	"strconv"
+	"time"
 )
 
 var (
-	serverLogFile, _ = os.OpenFile("server_log.txt", os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0)
+	serverLogFile, _ = os.OpenFile("server_log.txt", os.O_RDWR|os.O_TRUNC, 0)
 )
 
-type server struct {
-	port             int
-	epochLimit       int
-	epochMillis      int
-	windowSize       int
-	//init
-	conn             *lspnet.UDPConn
-	//accept
-	nextConnId       int
-	acceptClientChan chan *lspnet.UDPAddr
-	clientMap        map[int] *clientInfo
-	closeClientSignalChan chan int
-	clientEOF        chan int
-	//read
-	msgReceivedChan  chan Message
-	//write
-	msgToWriteChan chan Message
-	msgToWriteResponseChan chan bool
-	//close client
-	closeClientRequestChan chan int
-	closeClientResponseChan chan bool
-	//close
-	closeChan        chan bool
-	isShutdown       bool
-
-	//log
-	logger           *log.Logger
+type clientInfo struct {
+	clientAddr         *lspnet.UDPAddr
+	connID             int
+	nextWriteseqIndex  int
+	successWriteIndex  int
+	successReadIndex   int
+	haveBeenReadIndex  int
+	recvMessageChan    chan Message
+	sendMessageChan    chan Message
+	sendMessageQueue   *list.List
+	recvMessageQueue   *list.List
+	sendWindow         map[int]bool
+	recvWindow         map[int]bool
+	clientGoingToclose bool
+	clientCloseChan    chan struct{}
+	epoch              int
+	clientEpochChan    chan struct{}
+	clientShutDownChan chan struct{}
 }
 
-type clientInfo struct {
-	addr *lspnet.UDPAddr
-	server              *server
-	connId              int
-					    //read
-	msgReceivedQueue    *list.List      //only save msg that type = MsgData
-	msgToProcessChan    chan Message    //receive msg, not process
-	receiveHasAckSeqNum int
-	receivedMsgNotAckMap	    map[int]bool
-	receivedMsgMap map[int] Message
-					    //write
-	msgToWriteQueue     *list.List
-	msgToWriteChan      chan []byte
-	writeNextSeqNum     int             // next msg seq num
-	writeNotAckEarliest int
-	msgWrittenMap       map[int]Message //has written to conn, but not receive ack, the epoch will read this and resend msg
-	msgWrittenAckMap    map[int]bool    //when write a msg, will record false, when receive ack, record true
-					    //close
-	closeChan           chan bool
-					    //epoch
-	epochSignalChan     chan bool
-	epochCount          int
+type server struct {
+	serverWriteMethodChan             chan Message
+	serverWriteMethodChanResponse     chan bool
+	conn                              *lspnet.UDPConn
+	serverGoingToClose                bool
+	clientConnChan                    chan *lspnet.UDPAddr
+	nextClientID                      int
+	clientQueue                       map[int]*clientInfo
+	windowSize                        int //both the client and server will have the same window sizes
+	serverCloseConnMethodChan         chan int
+	serverCloseConnMethodChanResponse chan bool
+	serverCloseMethodCollect          chan struct{}
+	serverCloseMethodChan             chan struct{}
+	serverCloseMethodChanResponse     chan bool
+	epochlimit                        int
+	epochMillis                       int
+	serverReadMethodBufferChan        chan Message
+	clientEOF                         chan int
+	logger                            *log.Logger
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -78,169 +65,263 @@ type clientInfo struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
-	s := &server{
-		port: port,
-		epochLimit: params.EpochLimit,
-		epochMillis: params.EpochMillis,
-		windowSize: params.WindowSize,
 
-		nextConnId: 1,
-		clientMap: make(map[int] *clientInfo),
-		closeClientSignalChan: make(chan int, 10000),
-		clientEOF: make(chan int),
-		acceptClientChan: make(chan *lspnet.UDPAddr),
-		msgReceivedChan: make(chan Message, 10000),
-
-		msgToWriteChan: make(chan Message),
-		msgToWriteResponseChan: make(chan bool),
-
-		closeClientRequestChan: make(chan int),
-		closeClientResponseChan: make(chan bool),
-
-		closeChan: make(chan bool, 100),
-		isShutdown: false,
-		logger: log.New(serverLogFile, "Server-- ", log.Lmicroseconds|log.Lshortfile),
-
-	}
-	udpaddr, err := lspnet.ResolveUDPAddr("udp", lspnet.JoinHostPort("localhost", strconv.Itoa(port)))
+	addr, err := lspnet.ResolveUDPAddr("udp", lspnet.JoinHostPort("localhost", strconv.Itoa(port)))
 	if err != nil {
-		fmt.Println("resolve udp addr failed")
 		return nil, err
 	}
-	conn, e := lspnet.ListenUDP("udp", udpaddr)
-	if e != nil {
-		fmt.Println("listen udp failed")
-		return nil, e
+	conn, err := lspnet.ListenUDP("udp", addr)
+	if err != nil {
+		return nil, err
 	}
+	s := new(server)
+	s.clientEOF = make(chan int)
+	s.clientConnChan = make(chan *lspnet.UDPAddr)
+	s.clientQueue = make(map[int]*clientInfo)
 	s.conn = conn
-	go s.serverReadRoutine()
-	go s.serverEventHandlerRoutine()
+	s.epochMillis = params.EpochMillis
+	s.epochlimit = params.EpochLimit
+	s.logger = log.New(serverLogFile, "Server-- ", log.Lmicroseconds|log.Lshortfile)
+	s.nextClientID = 1
+	s.serverCloseMethodCollect = make(chan struct{})
+	s.serverCloseMethodChan = make(chan struct{})
+	s.serverCloseMethodChanResponse = make(chan bool)
+	s.serverCloseConnMethodChan = make(chan int)
+	s.serverCloseConnMethodChanResponse = make(chan bool)
+	s.serverGoingToClose = false
+	s.serverReadMethodBufferChan = make(chan Message, 10000)
+	s.serverWriteMethodChan = make(chan Message)
+	s.serverWriteMethodChanResponse = make(chan bool)
+	s.windowSize = params.WindowSize
 
-	return Server(s), nil
+	go s.ServerEventHandle()
+	go s.ReadFromAllClients()
+	return s, nil
 }
 
-func (s *server) Read() (int, []byte, error) {
-	if s.isShutdown {
-		return -1, nil, errors.New("server has bean shutdown")
-	}
-	select {
-	case msg := <- s.msgReceivedChan:
-		return msg.ConnID, msg.Payload, nil
-	case connID := <- s.clientEOF:
-		return connID, nil, errors.New("client has been closed")
-	}
-}
-
-func (s *server) Write(connID int, payload []byte) error {
-	if s.isShutdown {
-		return errors.New("server has bean shutdown")
-	}
-	msg := NewData(connID, -1, payload)
-	s.msgToWriteChan <- *msg
-	select {
-	case ok := <-s.msgToWriteResponseChan:
-		if ok {
-			return nil
-		} else {
-			return errors.New("the connID doesn't exist")
-		}
-	}
-}
-
-func (s *server) CloseConn(connID int) error {
-	if s.isShutdown {
-		return errors.New("server has bean shutdown")
-	}
-	s.closeClientRequestChan <- connID
-	select {
-	case ok := <-s.closeClientResponseChan:
-		if ok {
-			return nil
-		} else {
-			return errors.New("the connID doesn't exist")
-		}
-	}
-	return nil
-}
-
-func (s *server) Close() error {
-	if s.isShutdown {
-		return errors.New("server has bean shutdown")
-	}
-	s.logger.Printf("server Close method is invoked\n")
-	for i := 0; i < 3; i++ {
-		s.closeChan <- true
-	}
-	return nil
-}
-
-func NewClientInfo(addr *lspnet.UDPAddr, s *server, connId int) (cli *clientInfo) {
-	cli = &clientInfo{
-		addr: addr,
-		server: s,
-		connId: connId,
-
-		msgReceivedQueue: list.New(),
-		msgToProcessChan: make(chan Message),
-		receiveHasAckSeqNum: 0,
-		receivedMsgNotAckMap: make(map[int]bool),
-		receivedMsgMap: make(map[int]Message),
-
-		msgToWriteQueue: list.New(),
-		msgToWriteChan: make(chan []byte),
-		writeNextSeqNum: 1,
-		writeNotAckEarliest: 1,
-		msgWrittenMap: make(map[int]Message),
-		msgWrittenAckMap: make(map[int]bool),
-
-		closeChan: make(chan bool),
-
-		epochSignalChan: make(chan bool),
-		epochCount: 0,
-	}
-	go cli.clientEpochRoutine()
-	go cli.clientEventHandlerRoutine()
-	return cli
-}
-
-func (s *server) serverEventHandlerRoutine() {
+func (s *server) ServerEventHandle() {
 	for {
 		select {
-		case addr := <- s.acceptClientChan:
-			cli := NewClientInfo(addr, s, s.nextConnId)
-			s.nextConnId++
-			s.clientMap[cli.connId] = cli
-			pAck := NewAck(cli.connId, 0)
-			buf, _ := json.Marshal(*pAck)
-			s.conn.WriteToUDP(buf, cli.addr)
-		case <- s.closeChan:
-			s.isShutdown = true
-			for _, cli := range s.clientMap {
-				cli.close()
-			}
-			s.logger.Printf("server event handler get close signal, exit\n")
-			return
-		case connId:= <- s.closeClientSignalChan:
-			if cli, ok := s.clientMap[connId]; ok {
-				cli.close()
-				delete(s.clientMap, connId)
-				s.closeClientResponseChan <- true
+		case addr := <-s.clientConnChan:
+
+			c := new(clientInfo)
+			c.clientAddr = addr
+			c.clientCloseChan = make(chan struct{})
+			c.clientEpochChan = make(chan struct{})
+			c.clientGoingToclose = false
+			c.clientShutDownChan = make(chan struct{})
+			c.connID = s.nextClientID
+			c.epoch = 0
+			c.haveBeenReadIndex = 0
+			c.nextWriteseqIndex = 1
+			c.recvMessageChan = make(chan Message)
+			c.recvMessageQueue = list.New()
+			c.recvWindow = make(map[int]bool)
+			c.sendMessageChan = make(chan Message)
+			c.sendMessageQueue = list.New()
+			c.sendWindow = make(map[int]bool)
+			c.successReadIndex = 0
+			c.successWriteIndex = 0
+
+			s.logger.Printf("ServerEventHandle:: get new client connection ID:%d\n", c.connID)
+
+			s.clientQueue[c.connID] = c
+			s.nextClientID++
+			go c.ClientEventHandle(s)
+			go c.FireEpoch(s)
+			ack := NewAck(c.connID, 0)
+			buf, _ := json.Marshal(*ack)
+			s.conn.WriteToUDP(buf, c.clientAddr)
+		case mes := <-s.serverWriteMethodChan:
+			if _, ok := s.clientQueue[mes.ConnID]; ok {
+				s.serverWriteMethodChanResponse <- true
+				s.clientQueue[mes.ConnID].sendMessageChan <- mes
 			} else {
-				s.closeClientResponseChan <- false
+				s.serverWriteMethodChanResponse <- false
 			}
-		case msg := <- s.msgToWriteChan:
-			if cli, ok := s.clientMap[msg.ConnID]; ok {
-				cli.msgToWriteChan <- msg.Payload
-				s.msgToWriteResponseChan <- true
+		case <-s.serverCloseMethodChan:
+			s.logger.Printf("ServerEventHandle::server begin close\n")
+			s.serverGoingToClose = true
+
+			clientInfoLen := len(s.clientQueue)
+			for i := 0; i < clientInfoLen; i++ {
+				<-s.serverCloseMethodCollect
+			}
+			s.logger.Printf("ServerEventHandle::closing finish\n")
+			s.serverCloseMethodChanResponse <- true
+		case connID := <-s.serverCloseConnMethodChan:
+			if c, ok := s.clientQueue[connID]; ok {
+				s.serverCloseConnMethodChanResponse <- true //synchronization
+				c.clientCloseChan <- struct{}{}
+				delete(s.clientQueue, connID)
 			} else {
-				s.msgToWriteResponseChan <- false
+				s.serverCloseConnMethodChanResponse <- false
 			}
 		}
 	}
 }
 
-func (s *server) serverReadRoutine() {
-	var buf [MTU]byte
+func (c *clientInfo) ClientEventHandle(s *server) {
+	for {
+		select {
+		case mes := <-c.sendMessageChan:
+			if mes.Type == MsgAck {
+				buf, _ := json.Marshal(mes)
+				s.conn.WriteToUDP(buf, c.clientAddr)
+				s.logger.Printf("ClientEventHandle::send ack to client ID:%d SeqNum:%d\n", mes.ConnID, mes.SeqNum)
+			} else {
+				if mes.SeqNum == -1 {
+					mes.SeqNum = c.nextWriteseqIndex
+					c.nextWriteseqIndex++
+				}
+				c.sendMessageQueue.PushBack(mes)
+				if len(c.sendWindow) < s.windowSize {
+					buf, _ := json.Marshal(mes)
+					s.conn.WriteToUDP(buf, c.clientAddr)
+					c.sendWindow[mes.SeqNum] = false
+					s.logger.Printf("ClientEventHandle::send message to client ID:%d SeqNum:%d\n", mes.ConnID, mes.SeqNum)
+				}
+			}
+		case mes := <-c.recvMessageChan:
+			if mes.Type == MsgAck {
+				if mes.SeqNum > c.successWriteIndex {
+					c.sendWindow[mes.SeqNum] = true
+					{
+						buf, _ := json.Marshal(mes)
+						s.logger.Printf("ClientEventHandle::recv message:%s\n", string(buf))
+					}
+					i := c.successWriteIndex + 1
+					for {
+						val, isPresent := c.sendWindow[i]
+						if !isPresent || !val {
+							break
+						}
+						s.logger.Printf("ClientEventHandle::delete message:%d\n", i)
+						delete(c.sendWindow, i)
+						c.sendMessageQueue.Remove(c.sendMessageQueue.Front())
+						i++
+					}
+					c.successWriteIndex = i - 1
+
+					j := c.successWriteIndex + len(c.sendWindow) + 1
+					for e := c.sendMessageQueue.Front(); j <= c.successWriteIndex+s.windowSize && e != nil; e = e.Next() {
+						c.sendWindow[j] = false
+						buf, _ := json.Marshal(e.Value.(Message))
+						s.conn.WriteToUDP(buf, c.clientAddr)
+						j++
+						s.logger.Printf("ClientEventHandle::send message:%s\n", string(buf))
+					}
+				} else if mes.SeqNum == 0 { //keep alive
+					c.epoch = 0
+				}
+			} else { //receive data
+
+				/*
+					both clients and servers will also need to
+					maintain a sliding window for their ω most recently
+					sent acknowledgments
+				*/
+
+				if _, ok := c.recvWindow[mes.SeqNum]; !ok {
+					//have never received this Message
+					c.recvMessageQueue.PushBack(mes)
+					c.recvWindow[mes.SeqNum] = true
+
+					if mes.SeqNum > c.successReadIndex+s.windowSize {
+						for i := mes.SeqNum - s.windowSize; i > c.successReadIndex; i-- {
+							for e := c.recvMessageQueue.Front(); e != nil; e = e.Next() {
+								if e.Value.(Message).SeqNum == i {
+									c.recvMessageQueue.Remove(e)
+									delete(c.recvWindow, i)
+									break
+								}
+							}
+						}
+						c.successReadIndex = mes.SeqNum - s.windowSize
+					}
+
+					var i int
+					for i = c.haveBeenReadIndex + 1; i <= c.successReadIndex+s.windowSize && c.recvMessageQueue.Len() > 0; i++ {
+						if _, ok := c.recvWindow[i]; !ok {
+							break
+						}
+						for e := c.recvMessageQueue.Front(); e != nil; e = e.Next() {
+							if e.Value.(Message).SeqNum == i {
+								s.serverReadMethodBufferChan <- e.Value.(Message)
+								c.recvMessageQueue.Remove(e)
+								delete(c.recvWindow, i)
+
+								mes := NewAck(c.connID, e.Value.(Message).SeqNum)
+								buf, _ := json.Marshal(mes)
+								s.conn.WriteToUDP(buf, c.clientAddr)
+								s.logger.Printf("ClientEventHandle::send ack:%s\n", buf)
+								break
+							}
+						}
+					}
+					c.haveBeenReadIndex = i - 1
+				}
+			}
+		case <-c.clientEpochChan:
+		/*If no data messages have been received from the client,
+		then resend an acknowledg-ment message for the client’s connection request.
+		For each data message that has been sent, but not yet acknowledged,
+		resend the data message.
+		Resend an acknowledgment message for each of the last ω
+		(or possibly fewer) distinct data messages that have been received.*/
+			s.logger.Printf("fire epoch\n")
+			if len(c.sendWindow) == 0 && c.sendMessageQueue.Len() == 0 && c.clientGoingToclose {
+				if s.serverGoingToClose {
+					s.logger.Printf("ClientEventHandle::epoch  client %d is going to close\n", c.connID)
+					s.serverCloseMethodCollect <- struct{}{}
+					c.ShutDownAllThing(s)
+				}
+				c.ShutDownAllThing(s)
+				return
+			} else {
+				/*we will track at the endpoint of each connection the number
+				of epochs that have passed since a message (of any type) was
+				received from the other end. Once this count reaches a specified epoch
+				limit, which we denote with the symbol K, we will declare that the
+				connection has been lost.*/
+				c.epoch++
+				if c.epoch >= s.epochlimit {
+					s.logger.Printf("ClientEventHandle::epoch exceed\n")
+					if s.serverGoingToClose {
+						c.ShutDownAllThing(s)
+						s.serverCloseMethodCollect <- struct{}{}
+					}
+					c.ShutDownAllThing(s)
+					return
+				} else {
+					for i := c.successReadIndex + 1; i <= c.haveBeenReadIndex; i++ {
+						mes := NewAck(c.connID, i)
+						buf, _ := json.Marshal(*mes)
+						s.conn.WriteToUDP(buf, c.clientAddr)
+					}
+
+					for i, ok := range c.sendWindow {
+						if !ok {
+							for e := c.sendMessageQueue.Front(); e != nil; e = e.Next() {
+								if e.Value.(Message).SeqNum == i {
+									buf, _ := json.Marshal(e.Value.(Message))
+									s.conn.WriteToUDP(buf, c.clientAddr)
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		case <-c.clientCloseChan:
+			s.logger.Printf("ClientEventHandle::close ID:%d\n", c.connID)
+			c.clientGoingToclose = true
+		}
+	}
+}
+
+func (s *server) ReadFromAllClients() {
+	var buf [1500]byte
 	var mes Message
 	for {
 		n, addr, err := s.conn.ReadFromUDP(buf[0:])
@@ -252,174 +333,87 @@ func (s *server) serverReadRoutine() {
 		json.Unmarshal(buf[0:n], &mes)
 
 		if mes.Type == MsgConnect {
-			s.acceptClientChan <- addr
+			if !s.serverGoingToClose {
+				s.clientConnChan <- addr
+			}
 		} else {
-			if cli, ok := s.clientMap[mes.SeqNum]; ok {
-				cli.msgToProcessChan <- mes
-			} else {
-				s.logger.Printf("server receive msg, type=%v, connId=%d, can not find a client with this connId\n", mes.Type, mes.ConnID)
+			for _, c := range s.clientQueue {
+				if c.connID == mes.ConnID {
+					c.recvMessageChan <- mes
+					break
+				}
 			}
 		}
 	}
 }
 
-func (c *clientInfo) clientEpochRoutine() {
-	tick := time.Tick(time.Duration(c.server.epochMillis) * time.Millisecond)
+func (c *clientInfo) FireEpoch(s *server) {
+	tick := time.Tick(time.Duration(s.epochMillis) * time.Millisecond)
 	for {
 		select {
 		case <-tick:
-			c.epochSignalChan <- true
-		case <-c.closeChan:
-			c.server.logger.Println("clientInfo epoch routing exit")
+			c.clientEpochChan <- struct{}{}
+		case <-c.clientShutDownChan:
 			return
 		}
 	}
 }
 
-func (c *clientInfo) clientEventHandlerRoutine() {
-	for {
-		select {
-		case payload := <- c.msgToWriteChan:
-			pMsg := NewData(c.connId, c.writeNextSeqNum, payload)
-			c.writeNextSeqNum++
-			if pMsg.SeqNum < c.writeNotAckEarliest + c.server.windowSize {
-				buf, _ := json.Marshal(*pMsg)
-				c.server.conn.WriteToUDP(buf, c.addr)
-				c.msgWrittenMap[pMsg.SeqNum] = *pMsg
-				c.msgWrittenAckMap[pMsg.SeqNum] = false
-			} else {
-				c.msgToWriteQueue.PushBack(*pMsg)
-			}
-		case msg := <- c.msgToProcessChan:
-			c.epochCount = 0
-			if msg.Type == MsgData {
-				pAck := NewAck(c.connId, msg.SeqNum)
-				buf, _ := json.Marshal(*pAck)
-				c.server.conn.WriteToUDP(buf, c.addr)
-				if msg.SeqNum < c.receiveHasAckSeqNum + 1 {
-					c.server.logger.Printf("server process receive duplicate msg data, seqNum=%d\n", msg.SeqNum)
-					continue
-				} else if msg.SeqNum == c.receiveHasAckSeqNum + 1 {
-					c.server.logger.Printf("server process receive data msg, seqNum=%d\n", msg.SeqNum)
-					c.msgReceivedQueue.PushBack(msg)
-					if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
-						c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
-					}
-					c.server.msgReceivedChan <- msg
-					c.receiveHasAckSeqNum++
-					i := c.receiveHasAckSeqNum + 1
-					for ; i <= c.receiveHasAckSeqNum + c.server.windowSize; i++{
-						isReceived, ok := c.receivedMsgNotAckMap[i]
-						if !ok || !isReceived {
-							break;
-						}
-						//ack := NewAck(c.connId, c.receivedMsgMap[i].SeqNum)
-						//c.msgConnectChan <- *ack
-						c.server.msgReceivedChan <- c.receivedMsgMap[i]
-					}
-					c.receiveHasAckSeqNum = i - 1
-				} else if msg.SeqNum <= c.receiveHasAckSeqNum + c.server.windowSize {
-					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
-						c.server.logger.Printf("server process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
-						c.msgReceivedQueue.PushBack(msg)
-						if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
-							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
-						}
-						c.receivedMsgMap[msg.SeqNum] = msg
-						c.receivedMsgNotAckMap[msg.SeqNum] = true
-					}
-				} else {
-					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
-						c.server.logger.Printf("process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
-						c.msgReceivedQueue.PushBack(msg)
-						if c.msgReceivedQueue.Len() > c.server.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
-							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
-						}
-						c.receivedMsgMap[msg.SeqNum] = msg
-						c.receivedMsgNotAckMap[msg.SeqNum] = true
-						for i := c.receiveHasAckSeqNum + 1; i <= msg.SeqNum - c.server.windowSize; i++ {
-							delete(c.receivedMsgMap, i)
-							delete(c.receivedMsgNotAckMap, i)
-						}
-						c.receiveHasAckSeqNum = msg.SeqNum - c.server.windowSize
-					}
-				}
-			} else if msg.Type == MsgAck {
-				if msg.SeqNum == 0 {
-					c.server.logger.Printf("server receive keep alive ack msg\n")
-				} else if msg.SeqNum >= c.writeNotAckEarliest {
-					if msg.SeqNum == c.writeNotAckEarliest {
-						oldEarliest := c.writeNotAckEarliest
-						c.writeNotAckEarliest++
-						c.msgWrittenAckMap[msg.SeqNum] = false
-						delete(c.msgWrittenAckMap, msg.SeqNum)
-						delete(c.msgWrittenMap, msg.SeqNum)
-						i := c.writeNotAckEarliest
-						for {
-							isAck, ok := c.msgWrittenAckMap[i]
-							if !ok || !isAck {
-								break
-							}
-							c.writeNotAckEarliest++
-							delete(c.msgWrittenMap, i)
-							delete(c.msgWrittenAckMap, i)
-							i++
-						}
-						for i := 0; i < c.writeNotAckEarliest - oldEarliest && c.msgToWriteQueue.Len() > 0; i++ {
-							cacheMsg := c.msgToWriteQueue.Front()
-							c.msgToWriteQueue.Remove(cacheMsg)
-							buf, _ := json.Marshal(cacheMsg.Value.(Message))
-							c.server.conn.WriteToUDP(buf, c.addr)
-							c.msgWrittenMap[msg.SeqNum] = msg
-							c.msgWrittenAckMap[msg.SeqNum] = false
-						}
-					} else if msg.SeqNum > c.writeNotAckEarliest {
-						delete(c.msgWrittenMap, msg.SeqNum)
-						c.msgWrittenAckMap[msg.SeqNum] = true
-					}
-				} else {
-					c.server.logger.Println("receive duplicate ack msg, seqNum=" + strconv.Itoa(msg.SeqNum))
-				}
-			}
-		case <- c.epochSignalChan:
-			if c.epochCount > c.server.epochLimit && c.msgToWriteQueue.Len() == 0 {
-				c.close()
-				continue
-			}
-			c.epochCount++
-			if c.writeNextSeqNum == 1 {
-				c.server.logger.Println("epoch send msg seqNum = 0")
-				msg := NewAck(c.connId, 0)
-				buf, _ := json.Marshal(*msg)
-				c.server.conn.WriteToUDP(buf, c.addr)
-			} else {
-				for k, v := range c.msgWrittenMap {
-					if isAck, ok := c.msgWrittenAckMap[k]; ok{
-						if !isAck {
-							buf, _ := json.Marshal(v)
-							c.server.conn.WriteToUDP(buf, c.addr)
-						}
-					}
-				}
-				for iter := c.msgReceivedQueue.Front(); iter != nil; iter = iter.Next() {
-					msg := NewAck(c.connId, iter.Value.(Message).SeqNum)
-					buf, _ := json.Marshal(*msg)
-					c.server.conn.WriteToUDP(buf, c.addr)
-				}
-			}
-		case <- c.closeChan:
-			fmt.Println("clientInfo eventHandler routine exit")
-			return
+func (s *server) Read() (int, []byte, error) {
+	select {
+	case mes := <-s.serverReadMethodBufferChan:
+		return mes.ConnID, mes.Payload, nil
+	case connID := <-s.clientEOF:
+		return connID, nil, errors.New("client has been closed")
+	}
+}
+
+func (s *server) Write(connID int, payload []byte) error {
+	mes := NewData(connID, -1, payload)
+	s.serverWriteMethodChan <- *mes
+	{
+		buf, _ := json.Marshal(mes)
+		s.logger.Printf("Write::write message %s\n", string(buf))
+	}
+	select {
+	case ok := <-s.serverWriteMethodChanResponse:
+		if ok {
+			return nil
+		} else {
+			return errors.New("the connID doesn't exist")
 		}
 	}
 }
 
-func (c *clientInfo) close() error {
-	for i := 0; i < 20; i++ {
-		c.closeChan <- true
+func (s *server) CloseConn(connID int) error {
+	s.serverCloseConnMethodChan <- connID
+	select {
+	case ok := <-s.serverCloseConnMethodChanResponse:
+		if ok {
+			return nil
+		} else {
+			return errors.New("the connID doesn't exist")
+		}
 	}
-	c.server.clientEOF <- c.connId
-	c.server.closeClientSignalChan <- c.connId
-	return nil;
 }
 
+func (c *clientInfo) ShutDownAllThing(s *server) {
+	s.clientEOF <- c.connID //tell server I have already been closed
+}
+
+func (s *server) Close() error {
+	s.logger.Printf("Close::close\n")
+	s.serverGoingToClose = true
+
+	s.serverCloseMethodChan <- struct{}{}
+	for _, c := range s.clientQueue {
+		c.clientCloseChan <- struct{}{}
+	}
+	flag, _ := <-s.serverCloseMethodChanResponse
+	if flag {
+		s.logger.Printf("Close::closed\n")
+		return nil
+	} else {
+		return errors.New("not all client are closed\n")
+	}
+}
