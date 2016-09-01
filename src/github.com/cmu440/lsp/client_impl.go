@@ -88,7 +88,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		receivedMsgNotAckMap: make(map[int]bool),
 		receivedMsgMap: make(map[int]Message),
 
-		closeChan: make(chan(bool), 5),
+		closeChan: make(chan(bool), 100),
 		epochCount: 0,
 		epochSignalChan: make(chan bool, 100),
 		logger: log.New(clientLogFile, "Client-- ", log.Lmicroseconds|log.Lshortfile),
@@ -233,7 +233,7 @@ func (c *client) eventHandlerRoutine() {
 					}
 				} else {
 					if _, ok := c.receivedMsgMap[msg.SeqNum]; !ok {
-						c.logger.Printf("process receive data msg, larger than nextSeq=%d, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
+						c.logger.Printf("process receive data msg, larger than nextSeq=%d and larger than c.receiveHasAckSeqNum + c.windowSize, seqNum=%d\n", c.receiveHasAckSeqNum+1, msg.SeqNum)
 						c.msgReceivedQueue.PushBack(msg)
 						if c.msgReceivedQueue.Len() > c.windowSize { //only save the latest windowSize msg, epoch will use this to resend ack
 							c.msgReceivedQueue.Remove(c.msgReceivedQueue.Front())
@@ -301,8 +301,7 @@ func (c *client) eventHandlerRoutine() {
 				c.msgToWriteQueue.PushBack(*msg)
 			}
 		case <- c.epochSignalChan:
-			c.epochCount++
-			if c.epochCount > c.epochLimit {
+			if c.epochCount > c.epochLimit && c.msgToWriteQueue.Len() == 0 {
 				if c.connId == 0 {
 					c.Close()
 					c.shutdownChan <- true
@@ -312,6 +311,7 @@ func (c *client) eventHandlerRoutine() {
 					continue
 				}
 			}
+			c.epochCount++
 			if c.connId == 0 {
 				c.logger.Println("epoch resend connect msg")
 				msg := NewConnect();
@@ -336,7 +336,7 @@ func (c *client) eventHandlerRoutine() {
 				}
 			}
 		case <- c.closeChan:
-			c.logger.Printf("client %d event handler exit\n", c.connId)
+			c.logger.Printf("server client %d event handler exit\n", c.connId)
 			return
 		}
 	}
