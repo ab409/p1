@@ -3,6 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"github.com/cmu440/lsp"
+	"github.com/cmu440/bitcoin"
+	"strconv"
+	"encoding/json"
 )
 
 func main() {
@@ -13,6 +17,32 @@ func main() {
 	}
 
 	// TODO: implement this!
+	c, err := lsp.NewClient(os.Args[1], lsp.NewParams())
+	if err != nil {
+		printDisconnected()
+		return
+	}
+	max, _ := strconv.ParseUint(os.Args[3], 10, 64)
+	request := bitcoin.NewRequest(os.Args[2], 0, max)
+	buf, _ := json.Marshal(request)
+	err = c.Write(buf)
+	if err != nil {
+		printDisconnected()
+		return
+	}
+	buf, err = c.Read()
+	if err != nil {
+		printDisconnected()
+		return
+	}
+	var result bitcoin.Message
+	err = json.Unmarshal(buf, &result)
+	if err != nil {
+		printDisconnected()
+		return
+	}
+	printResult(strconv.FormatUint(result.Hash, 10), strconv.FormatUint(result.Nonce, 10))
+	c.Close()
 }
 
 // printResult prints the final result to stdout.
