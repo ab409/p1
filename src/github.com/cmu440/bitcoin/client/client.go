@@ -22,6 +22,7 @@ func main() {
 		printDisconnected()
 		return
 	}
+	defer c.Close()
 	max, _ := strconv.ParseUint(os.Args[3], 10, 64)
 	request := bitcoin.NewRequest(os.Args[2], 0, max)
 	buf, _ := json.Marshal(request)
@@ -42,7 +43,6 @@ func main() {
 		return
 	}
 	printResult(strconv.FormatUint(result.Hash, 10), strconv.FormatUint(result.Nonce, 10))
-	c.Close()
 }
 
 // printResult prints the final result to stdout.
