@@ -61,14 +61,25 @@ func main() {
 	}
 }
 
-func splitRequest(request bitcoin.Message, availableMiner <-chan int, requestSplitCount map[int]int, requestID int, s lsp.Server) {
+func splitRequest(request bitcoin.Message, availableMiner <-chan int, requestSplitCount map[int]int, requestID int, s lsp.Server, requestQueue chan<- bitcoin.Message) {
 	availableMinerCnt := len(availableMiner)
 	requestRange := request.Upper - request.Lower
-	perRequestRange := requestRange / availableMiner
+	perRequestRange := requestRange / availableMinerCnt
+	if requestRange % availableMinerCnt != 0{
+		perRequestRange += 1
+	}
 	for i := 0; i < availableMinerCnt; i++ {
-		perRequest := bitcoin.NewRequest(request.Data, request.Lower + uint64(i * perRequestRange), request.Lower + uint64((i+1) * perRequestRange))
+		var perRequest *bitcoin.Message
+		if i == availableMinerCnt - 1 {
+			perRequest = bitcoin.NewRequest(request.Data, request.Lower + uint64(i * perRequestRange), request.Upper)
+		} else {
+			perRequest = bitcoin.NewRequest(request.Data, request.Lower + uint64(i * perRequestRange), request.Lower - 1 + uint64((i+1) * perRequestRange))
+		}
 		buf, _ := json.Marshal(perRequest)
 		miner := <-availableMiner
-		s.Write(miner, buf)
+		err := s.Write(miner, buf)
+		if err != nil {
+			requestQueue <- perRequest
+		}
 	}
 }
