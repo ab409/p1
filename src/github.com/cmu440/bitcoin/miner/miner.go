@@ -24,11 +24,7 @@ func main() {
 	}
 	defer c.Close()
 	join := bitcoin.NewJoin()
-	buf, err := json.Marshal(join)
-	if err != nil {
-		fmt.Println("miner marshal join msg to json failed")
-		return
-	}
+	buf, _ := json.Marshal(join)
 	err = c.Write(buf)
 	if err != nil {
 		fmt.Println("miner join server failed")
@@ -41,11 +37,7 @@ func main() {
 			return
 		}
 		var request bitcoin.Message
-		err = json.Unmarshal(buf, &request)
-		if err != nil {
-			fmt.Println("miner read request from server is invalid")
-			return
-		}
+		json.Unmarshal(buf, &request)
 		var minValue uint64 = math.MaxUint64
 		var minIndex uint64
 		for i := request.Lower; i <= request.Upper; i++ {
@@ -56,11 +48,7 @@ func main() {
 			}
 		}
 		result := bitcoin.NewResult(minValue, minIndex)
-		buf, err = json.Marshal(result)
-		if err != nil {
-			fmt.Println("miner marshal result to json failed")
-			return
-		}
+		buf, _ = json.Marshal(result)
 		err = c.Write(buf)
 		if err != nil {
 			fmt.Println("miner write result to server failed")

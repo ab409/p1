@@ -37,11 +37,7 @@ func main() {
 		return
 	}
 	var result bitcoin.Message
-	err = json.Unmarshal(buf, &result)
-	if err != nil {
-		printDisconnected()
-		return
-	}
+	json.Unmarshal(buf, &result)
 	printResult(strconv.FormatUint(result.Hash, 10), strconv.FormatUint(result.Nonce, 10))
 }
 
