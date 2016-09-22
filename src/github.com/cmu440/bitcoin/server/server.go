@@ -48,10 +48,10 @@ type minerPool struct {
 
 func newMinerPool(s lsp.Server) *minerPool {
 	pool := &minerPool{
-		availableMinerChan: make(chan int, 10000),
+		availableMinerChan: make(chan int, 100000),
 		availableMinerMap: make(map[int]bool),
 		workingMinerRequestMap: make(map[int]*requestWrap),
-		requestQueue: make(chan *requestWrap, 10000),
+		requestQueue: make(chan *requestWrap, 100000),
 		clientMap: make(map[int]bool),
 		s: s,
 	}
@@ -130,14 +130,16 @@ func (p *minerPool) isRequestQueueEmpty() bool {
 }
 
 func (p *minerPool) executeQueuedReq() {
-	if p.isRequestQueueEmpty() {
-		return
+	for len(p.availableMinerMap) > 0 {
+		if p.isRequestQueueEmpty() {
+			return
+		}
+		request := <- p.requestQueue
+		if _, ok := p.clientMap[request.clientID]; !ok {
+			continue
+		}
+		p.execute(request)
 	}
-	request := <- p.requestQueue
-	if _, ok := p.clientMap[request.clientID]; !ok {
-		return
-	}
-	p.execute(request)
 }
 
 func (p *minerPool) addAvailableMiner(connID int) {
