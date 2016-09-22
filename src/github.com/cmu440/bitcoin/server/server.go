@@ -107,7 +107,7 @@ func (p *minerPool) execute(r *requestWrap) {
 			buf, _ := json.Marshal(perRequest)
 			err := p.s.Write(miner, buf)
 			if err != nil {
-				p.requestQueue <- perRequest
+				p.requestQueue <- childRequestWarp
 				p.s.CloseConn(miner)
 			} else {
 				p.workingMinerRequestMap[miner] = childRequestWarp
@@ -161,6 +161,15 @@ func (p *minerPool) getMinerWorkingRequest(minerID int) *requestWrap {
 	return p.workingMinerRequestMap[minerID]
 }
 
+func (p *minerPool) submitResult(minerID int, result *bitcoin.Message) (bool, *bitcoin.Message) {
+	delete(p.workingMinerRequestMap, minerID) // del workingMinerRequestMap, this miner is available
+	req := p.getMinerWorkingRequest(minerID)
+	if req == nil {
+		return false, nil
+	}
+	return p.collectResult(req, result)
+}
+
 func (p *minerPool) collectResult(request *requestWrap, result *bitcoin.Message) (bool, *bitcoin.Message) {
 	if _, ok := p.clientMap[request.clientID]; !ok {
 		return false, nil
@@ -173,6 +182,7 @@ func (p *minerPool) collectResult(request *requestWrap, result *bitcoin.Message)
 		return false, nil
 	}
 	if request.parent == nil {
+		p.cancelReq(request.clientID) //cancel request, after this any result submit by other miners will be ignored
 		return true, request.result
 	}
 	return p.collectResult(request.parent, request.result)
@@ -232,7 +242,7 @@ func main() {
 		case bitcoin.Result:
 			//miner return result
 			if req := pool.getMinerWorkingRequest(connID); req != nil {
-				if ok, result := pool.collectResult(req, msg); ok {
+				if ok, result := pool.submitResult(connID, &msg); ok {
 					buf, _ := json.Marshal(result)
 					err := s.Write(req.clientID, buf)
 					if err != nil {
