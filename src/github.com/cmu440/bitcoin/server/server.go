@@ -134,6 +134,9 @@ func (p *minerPool) executeQueuedReq() {
 		return
 	}
 	request := <- p.requestQueue
+	if _, ok := p.clientMap[request.clientID]; !ok {
+		return
+	}
 	p.execute(request)
 }
 
