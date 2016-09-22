@@ -30,7 +30,6 @@ func newRequestWrap(request *bitcoin.Message, parent *requestWrap, clientID int)
 		request: request,
 		splitCount: 1,
 		resultCount: 0,
-		childrenRequest: list.New(),
 		parent: parent,
 	}
 	requestID++
@@ -77,7 +76,6 @@ func (p *minerPool) execute(r *requestWrap) {
 			p.rmAvailableMiner(miner)
 			var perRequest *bitcoin.Message = bitcoin.NewRequest(r.request.Data, r.request.Lower + uint64(i), r.request.Lower + uint64(i))
 			childRequestWarp := newRequestWrap(*perRequest, r, r.clientID)
-			r.childrenRequest.PushBack(childRequestWarp)
 			buf, _ := json.Marshal(perRequest)
 			err := p.s.Write(miner, buf)
 			if err != nil {
@@ -106,7 +104,6 @@ func (p *minerPool) execute(r *requestWrap) {
 			p.rmAvailableMiner(miner)
 			var perRequest *bitcoin.Message = bitcoin.NewRequest(r.request.Data, lower, upper)
 			childRequestWarp := newRequestWrap(*perRequest, r, r.clientID)
-			r.childrenRequest.PushBack(childRequestWarp)
 			buf, _ := json.Marshal(perRequest)
 			err := p.s.Write(miner, buf)
 			if err != nil {
