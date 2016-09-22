@@ -74,7 +74,7 @@ func (p *minerPool) execute(r *requestWrap) {
 				i--
 				continue
 			}
-			delete(p.availableMinerMap, miner)
+			p.rmAvailableMiner(miner)
 			var perRequest *bitcoin.Message = bitcoin.NewRequest(r.request.Data, r.request.Lower + uint64(i), r.request.Lower + uint64(i))
 			childRequestWarp := newRequestWrap(*perRequest, r, r.clientID)
 			r.childrenRequest.PushBack(childRequestWarp)
@@ -103,7 +103,7 @@ func (p *minerPool) execute(r *requestWrap) {
 				i--
 				continue
 			}
-			delete(p.availableMinerMap, miner)
+			p.rmAvailableMiner(miner)
 			var perRequest *bitcoin.Message = bitcoin.NewRequest(r.request.Data, lower, upper)
 			childRequestWarp := newRequestWrap(*perRequest, r, r.clientID)
 			r.childrenRequest.PushBack(childRequestWarp)
