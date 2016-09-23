@@ -174,11 +174,11 @@ func (p *minerPool) getMinerWorkingRequest(minerID int) *requestWrap {
 }
 
 func (p *minerPool) submitResult(minerID int, result *bitcoin.Message) (bool, *bitcoin.Message) {
-	delete(p.workingMinerRequestMap, minerID) // del workingMinerRequestMap, this miner is available
 	req := p.getMinerWorkingRequest(minerID)
 	if req == nil {
 		return false, nil
 	}
+	delete(p.workingMinerRequestMap, minerID) // del workingMinerRequestMap, this miner is available
 	return p.collectResult(req, result)
 }
 
