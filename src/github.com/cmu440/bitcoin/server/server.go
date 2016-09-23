@@ -63,6 +63,7 @@ func (p *minerPool) execute(r *requestWrap) {
 	if availableMinerCnt == 1 { //if only one miner is available, not need to split request
 		miner := <-p.availableMinerChan
 		if _, ok := p.availableMinerMap[miner]; !ok {
+			p.requestQueue <- r
 			return
 		}
 		p.rmAvailableMiner(miner)
