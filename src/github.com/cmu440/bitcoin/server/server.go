@@ -7,7 +7,6 @@ import (
 	"github.com/cmu440/lsp"
 	"github.com/cmu440/bitcoin"
 	"encoding/json"
-	"container/list"
 )
 
 type requestWrap struct {
@@ -16,7 +15,6 @@ type requestWrap struct {
 	request         *bitcoin.Message
 	splitCount      int
 	resultCount     int
-	childrenRequest *list.List
 	result          *bitcoin.Message
 }
 
