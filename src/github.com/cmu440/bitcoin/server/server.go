@@ -11,7 +11,6 @@ import (
 )
 
 type requestWrap struct {
-	id              int
 	clientID        int
 	parent          *requestWrap
 	request         *bitcoin.Message
@@ -25,7 +24,6 @@ var requestID int = 1
 
 func newRequestWrap(request *bitcoin.Message, parent *requestWrap, clientID int) *requestWrap {
 	wrap := &requestWrap{
-		id: requestID,
 		clientID: clientID,
 		request: request,
 		splitCount: 1,
@@ -62,6 +60,22 @@ func (p *minerPool) execute(r *requestWrap) {
 	availableMinerCnt := len(p.availableMinerMap)
 	if availableMinerCnt == 0 {
 		p.requestQueue <- r
+		return
+	}
+	if availableMinerCnt == 1 { //if only one miner is available, not need to split request
+		miner := <-p.availableMinerChan
+		if _, ok := p.availableMinerMap[miner]; !ok {
+			return
+		}
+		p.rmAvailableMiner(miner)
+		buf, _ := json.Marshal(r.request)
+		err := p.s.Write(miner, buf)
+		if err != nil {
+			p.requestQueue <- r
+			p.s.CloseConn(miner)
+		} else {
+			p.workingMinerRequestMap[miner] = r
+		}
 		return
 	}
 	requestRange := r.request.Upper - r.request.Lower + 1
