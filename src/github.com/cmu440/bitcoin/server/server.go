@@ -78,9 +78,9 @@ func (p *minerPool) execute(r *requestWrap) {
 		return
 	}
 	requestRange := r.request.Upper - r.request.Lower + 1
-	if requestRange <= availableMinerCnt {
+	if requestRange <= uint64(availableMinerCnt) {
 		r.splitCount = int(requestRange)
-		for i := 0; i < requestRange; i++ {
+		for i := 0; i < int(requestRange); i++ {
 			miner := <-p.availableMinerChan
 			if _, ok := p.availableMinerMap[miner]; !ok {
 				i--
@@ -88,7 +88,7 @@ func (p *minerPool) execute(r *requestWrap) {
 			}
 			p.rmAvailableMiner(miner)
 			var perRequest *bitcoin.Message = bitcoin.NewRequest(r.request.Data, r.request.Lower + uint64(i), r.request.Lower + uint64(i))
-			childRequestWarp := newRequestWrap(*perRequest, r, r.clientID)
+			childRequestWarp := newRequestWrap(perRequest, r, r.clientID)
 			buf, _ := json.Marshal(perRequest)
 			err := p.s.Write(miner, buf)
 			if err != nil {
@@ -100,10 +100,10 @@ func (p *minerPool) execute(r *requestWrap) {
 		}
 	} else {
 		r.splitCount = int(availableMinerCnt)
-		perRequestRange := requestRange / availableMinerCnt
-		mod := requestRange % availableMinerCnt
+		perRequestRange := int(requestRange) / availableMinerCnt
+		mod := int(requestRange) % availableMinerCnt
 		var lower uint64 = r.request.Lower
-		var upper uint64 = r.request.Lower + perRequestRange - 1
+		var upper uint64 = r.request.Lower + uint64(perRequestRange) - 1
 		if mod > 0 {
 			upper += 1
 			mod--
@@ -116,7 +116,7 @@ func (p *minerPool) execute(r *requestWrap) {
 			}
 			p.rmAvailableMiner(miner)
 			var perRequest *bitcoin.Message = bitcoin.NewRequest(r.request.Data, lower, upper)
-			childRequestWarp := newRequestWrap(*perRequest, r, r.clientID)
+			childRequestWarp := newRequestWrap(perRequest, r, r.clientID)
 			buf, _ := json.Marshal(perRequest)
 			err := p.s.Write(miner, buf)
 			if err != nil {
@@ -126,7 +126,7 @@ func (p *minerPool) execute(r *requestWrap) {
 				p.workingMinerRequestMap[miner] = childRequestWarp
 			}
 			lower = upper + 1
-			upper = lower + perRequestRange - 1
+			upper = lower + uint64(perRequestRange) - 1
 			if mod > 0 {
 				upper += 1
 				mod--
